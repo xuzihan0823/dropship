@@ -94,14 +94,22 @@ Mac 客户端 ──/usr/bin/ssh──> ~/.local/share/dropship/agent <模式参
 ### 2.2 接收模式 `agent --recv`（上传：Mac → 服务器）
 
 ```
-agent --recv --path <目标绝对路径> [--offset N] [--compress gzip] [--expect-size N] [--expect-hash <hex>]
+agent --recv --path <目标绝对路径> --expect-size N [--offset N] [--compress gzip] [--expect-hash <hex>]
 ```
 
 行为：
 1. 从 **stdin 读取裸二进制**（若 `--compress gzip` 则先解压）
 2. 写入 `<目标路径>.dropship-part` 临时文件；`--offset N` 表示从第 N 字节续写
-3. stdin 正常结束后，若给了 `--expect-hash` 则校验，通过后**原子 rename** 为目标路径
-4. 校验失败：保留 `.part` 文件，以非零码退出，stderr 输出错误 JSON
+3. stdin 结束后**必须校验实际写入字节数是否等于 `--expect-size`**，不等则判定为传输被截断
+4. 字节数校验通过后，若给了 `--expect-hash` 则再校验哈希
+5. 全部校验通过才**原子 rename** 为目标路径
+6. 任一校验失败：**保留 `.part` 文件，不得 rename**，以非零码退出，stderr 输出错误 JSON
+
+**`--expect-size` 是必需参数。** 未提供时 agent 必须以 `EPROTO` 拒绝执行，不得默认放行。
+
+> **为什么强制**：真机实测确认，SSH 断线会让 stdin 提前 EOF，agent 无法区分"正常传完"和"被截断"。
+> 实测中一个 2.5MB 的半截文件成功覆盖了服务器上的原文件，agent 报告 `done` 且退出码为 0。
+> 文件大小在客户端是零成本已知的，因此强制传入，由 agent 做最后一道防线。
 
 **要求**：必须先写临时文件再 rename。**禁止**直接写目标路径——传输中断会毁掉服务器上的原文件。
 
@@ -144,6 +152,7 @@ agent --send --path <源绝对路径> [--offset N] [--compress gzip]
 | `EEXIST` | 已存在 | 询问覆盖 |
 | `ENOSPC` | 空间不足 | 提示，不重试 |
 | `EISDIR` / `ENOTDIR` | 类型不符 | 提示，不重试 |
+| `ESIZE` | 收到字节数与 `--expect-size` 不符（传输被截断） | 自动续传重试 |
 | `EHASH` | 哈希校验失败 | 自动重传一次 |
 | `EPROTO` | 协议错误 | 报 bug |
 | `EINTERNAL` | 内部错误 | 附日志 |

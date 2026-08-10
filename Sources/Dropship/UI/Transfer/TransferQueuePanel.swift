@@ -1,0 +1,345 @@
+import SwiftUI
+
+// ============================================================
+// 传输队列面板：底部可折叠，展示所有任务。
+// ============================================================
+
+struct TransferQueuePanel: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @ObservedObject private var queue: MockTransferQueue
+
+    init(queue: MockTransferQueue) {
+        self.queue = queue
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if env.transferPanelExpanded {
+                Divider()
+                taskList
+            }
+        }
+        .background(.regularMaterial)
+        .frame(maxHeight: env.transferPanelExpanded ? .infinity : nil)
+    }
+
+    // MARK: - 顶部工具栏
+
+    @ViewBuilder
+    private var header: some View {
+        HStack(spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    env.transferPanelExpanded.toggle()
+                }
+            } label: {
+                Image(systemName: env.transferPanelExpanded
+                      ? "chevron.down"
+                      : "chevron.up")
+                    .font(.body)
+            }
+            .buttonStyle(.borderless)
+            .help(env.transferPanelExpanded ? "折叠传输队列" : "展开传输队列")
+
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.secondary)
+                Text("传输队列")
+                    .font(.headline)
+            }
+
+            if !queue.tasks.isEmpty {
+                Text("\(activeCount) 个进行中 · \(queue.tasks.count) 个任务")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if activeCount > 0 || completedCount > 0 {
+                overallProgress
+            }
+
+            Button {
+                queue.clearFinished()
+            } label: {
+                Label("清除已完成", systemImage: "checkmark.broom")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(queue.tasks.allSatisfy { !isFinished($0) })
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    @ViewBuilder
+    private var overallProgress: some View {
+        let total = queue.tasks.filter { $0.totalBytes > 0 }.reduce(Int64(0)) { $0 + $1.totalBytes }
+        let done = queue.tasks.filter { $0.totalBytes > 0 }.reduce(Int64(0)) { $0 + $1.transferredBytes }
+        let ratio = total > 0 ? Double(done) / Double(total) : 0
+        HStack(spacing: 6) {
+            Text("总体")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ProgressView(value: ratio)
+                .frame(width: 80)
+            Text(Formatters.percent(ratio))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - 任务列表
+
+    @ViewBuilder
+    private var taskList: some View {
+        if queue.tasks.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: "tray")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("没有传输任务")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 20)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(queue.tasks) { task in
+                        TransferRow(task: task)
+                            .contextMenu {
+                                taskContextMenu(for: task)
+                            }
+                        if task.id != queue.tasks.last?.id {
+                            Divider().padding(.leading, 44)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func taskContextMenu(for task: TransferTask) -> some View {
+        switch task.state {
+        case .transferring, .preparing, .verifying:
+            Button {
+                queue.pause(task.id)
+            } label: {
+                Label("暂停", systemImage: "pause")
+            }
+            Button(role: .destructive) {
+                queue.cancel(task.id)
+            } label: {
+                Label("取消", systemImage: "xmark")
+            }
+        case .paused:
+            Button {
+                queue.resume(task.id)
+            } label: {
+                Label("恢复", systemImage: "play")
+            }
+            Button(role: .destructive) {
+                queue.cancel(task.id)
+            } label: {
+                Label("取消", systemImage: "xmark")
+            }
+        case .failed:
+            Button {
+                queue.retry(task.id)
+            } label: {
+                Label("重试", systemImage: "arrow.clockwise")
+            }
+            Button(role: .destructive) {
+                queue.cancel(task.id)
+            } label: {
+                Label("移除", systemImage: "trash")
+            }
+        case .queued:
+            Button(role: .destructive) {
+                queue.cancel(task.id)
+            } label: {
+                Label("取消", systemImage: "xmark")
+            }
+        case .completed, .skipped, .cancelled:
+            Button(role: .destructive) {
+                queue.tasks.removeAll { $0.id == task.id }
+                queue.objectWillChange.send()
+            } label: {
+                Label("移除", systemImage: "trash")
+            }
+        }
+    }
+
+    // MARK: - 计算
+
+    private var activeCount: Int {
+        queue.tasks.filter {
+            switch $0.state {
+            case .transferring, .preparing, .verifying: return true
+            default: return false
+            }
+        }.count
+    }
+
+    private var completedCount: Int {
+        queue.tasks.filter {
+            switch $0.state {
+            case .completed, .skipped: return true
+            default: return false
+            }
+        }.count
+    }
+
+    private func isFinished(_ t: TransferTask) -> Bool {
+        switch t.state {
+        case .completed, .skipped, .cancelled: return true
+        default: return false
+        }
+    }
+}
+
+// MARK: - 单行任务
+
+private struct TransferRow: View {
+    let task: TransferTask
+
+    var body: some View {
+        HStack(spacing: 12) {
+            directionIcon
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(task.filename)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    statusLabel
+                }
+                HStack(spacing: 8) {
+                    if showsProgress {
+                        ProgressView(value: task.progress)
+                            .progressViewStyle(.linear)
+                            .frame(maxWidth: .infinity)
+                        Text(Formatters.percent(task.progress))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                    if let speed = speedText {
+                        Text(speed)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    if let eta = etaText {
+                        Text(eta)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(Formatters.fileSize(task.transferredBytes)
+                         + " / "
+                         + Formatters.fileSize(task.totalBytes))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var directionIcon: some View {
+        ZStack {
+            Circle()
+                .fill(.quaternary)
+                .frame(width: 28, height: 28)
+            Image(systemName: task.direction == .upload
+                  ? "arrow.up"
+                  : "arrow.down")
+                .font(.callout)
+                .foregroundStyle(task.direction == .upload
+                                ? Color.orange
+                                : Color.blue)
+        }
+        .frame(width: 28)
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        switch task.state {
+        case .queued:
+            statusBadge("排队中", color: .secondary, icon: "hourglass")
+        case .preparing:
+            statusBadge("准备中", color: .orange, icon: "gear")
+        case .transferring:
+            statusBadge("传输中", color: .accentColor, icon: "arrow.triangle.2.circlepath")
+        case .verifying:
+            statusBadge("校验中", color: .purple, icon: "checkmark.shield")
+        case .completed:
+            statusBadge("已完成", color: .green, icon: "checkmark.circle.fill")
+        case .skipped:
+            statusBadge("已跳过（内容一致）", color: .teal, icon: "checkmark.seal.fill")
+        case .paused:
+            statusBadge("已暂停", color: .secondary, icon: "pause.circle")
+        case .failed(let err):
+            HStack(spacing: 3) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                Text(err.message)
+                    .font(.caption)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.red)
+        case .cancelled:
+            statusBadge("已取消", color: .secondary, icon: "xmark.circle")
+        }
+    }
+
+    @ViewBuilder
+    private func statusBadge(_ text: String, color: Color, icon: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(text)
+                .font(.caption)
+        }
+        .foregroundStyle(color)
+    }
+
+    private var showsProgress: Bool {
+        switch task.state {
+        case .transferring, .paused, .verifying, .preparing, .failed:
+            return task.totalBytes > 0
+        case .completed, .skipped:
+            return task.totalBytes > 0
+        case .queued:
+            return task.totalBytes > 0
+        case .cancelled:
+            return false
+        }
+    }
+
+    private var speedText: String? {
+        switch task.state {
+        case .transferring:
+            return Formatters.speed(task.speed)
+        default:
+            return nil
+        }
+    }
+
+    private var etaText: String? {
+        switch task.state {
+        case .transferring:
+            return Formatters.eta(task.eta)
+        default:
+            return nil
+        }
+    }
+}
