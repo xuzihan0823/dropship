@@ -9,7 +9,8 @@ import AppKit
 enum Formatters {
     private static let byteFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
-        f.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+        // 含 useBytes：否则 411 字节的文件会显示成 "0 KB"
+        f.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
         f.countStyle = .file
         // 默认会把 0 渲染成 "Zero KB"，在传输队列里看着像坏了
         f.allowsNonnumericFormatting = false

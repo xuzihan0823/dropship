@@ -56,6 +56,21 @@ ssh <host> '~/.local/share/dropship/agent --version'
 
 ## 质量记录
 
+### SwiftUI 界面完成并修复 3 个集成缺陷（2026-08-10）
+
+2767 行，`swift build` 零错误零警告。深浅色模式均已截图验证，界面按 macOS 原生规范渲染。
+
+界面线因 GLM 模型限额中断在截图前，剩余验证与修复由主控接手。启动时连续崩溃两次，均已定位修复：
+
+| 缺陷 | 位置 | 后果 |
+|---|---|---|
+| 对空数组调用 `removeFirst()` | `Breadcrumbs.pathSegments()` | **启动必崩**。该行结果被 `_ =` 丢弃且变量之后未再使用，是完全多余的代码，但路径为 `/` 时数组为空必然触发断言。远程面板初始即为根目录 |
+| 漏注入 `EnvironmentObject` | `RootView` → `ServerSidebar` | **启动必崩**。同级另三个面板都注入了，唯独侧边栏遗漏。已改为在根部统一注入 |
+| `ByteCountFormatter` 把 0 渲染成 "Zero KB" | `Formatters.byteSize` | 传输队列里 0 字节任务显示 "Zero KB / 156 MB"，看着像坏了。已设 `allowsNonnumericFormatting = false` |
+
+已验证可用：服务器侧边栏（含 Agent/SFTP 降级状态区分、连接失败原因显示）、双文件面板、
+面包屑、文件类型图标、传输队列（进度/速度/ETA/状态）、深浅色适配。
+
 ### Go agent 真机验证通过（2026-08-10）
 
 1001 行，`go build` + `go vet` 零警告。二进制静态链接、stripped，amd64 2.5M / arm64 2.4M。
@@ -184,8 +199,15 @@ open build/Dropship.app
 
 ## 待办
 
-- [ ] A · Go agent 实现
-- [ ] B · Swift Core 实现
-- [ ] C · SwiftUI 界面实现
-- [ ] 集成与真机验证（tencent-dev root / aliyun02 非 root）
-- [ ] 拖出 Finder 的 `NSFilePromiseProvider` 验证
+- [x] A · Go agent 实现（真机验证通过，含截断防护）
+- [x] C · SwiftUI 界面实现（深浅色截图验证通过）
+- [x] 拖出 Finder 的承诺式拖拽验证（纯 SwiftUI 可行）
+- [ ] B · Swift Core 实现（返工中）
+- [ ] 集成：Core 接入真实传输，替换 UI 的 Mock
+- [ ] 端到端真机验证（tencent-dev root / aliyun02 非 root）
+
+## 模型可用性备注
+
+GLM 于 2026-08-10 达到限额，A 线与 C 线（均为 GLM）中断。
+**agent 模型在 spawn 后不可更改**，因此处理方式为停止该 agent、由主控或其他模型接手，
+而非"通知其换模型"。两条线的产出均已保全并完成验证。

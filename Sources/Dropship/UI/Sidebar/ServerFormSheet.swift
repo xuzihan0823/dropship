@@ -56,11 +56,13 @@ struct ServerFormSheet: View {
                             .frame(width: 80)
                     }
                 }
-                Section("认证") {
+                Section {
                     TextField("私钥路径", text: $identityFile)
                         .textFieldStyle(.roundedBorder)
-                        .help("留空则交由 ssh 自动选择")
-                    Text("可填入 ~/.ssh/id_ed25519 或绝对路径")
+                } header: {
+                    Text("认证")
+                } footer: {
+                    Text("留空则交由 ssh 自行选择；也可填 ~/.ssh/id_ed25519 或绝对路径")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -80,10 +82,11 @@ struct ServerFormSheet: View {
                 }
             }
             .formStyle(.grouped)
-            .scrollDisabled(true)
             footer
         }
-        .frame(width: 480, height: 540)
+        // 表单较长，放开滚动并留足高度：此前写死 540 且禁用滚动，
+        // 导致「默认目录」一节被窗口下沿切断，只露出半行字。
+        .frame(width: 480, height: 600)
     }
 
     @ViewBuilder

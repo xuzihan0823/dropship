@@ -7,13 +7,13 @@ import AppKit
 
 struct ServerSidebar: View {
     @EnvironmentObject private var env: AppEnvironment
-    @ObservedObject private var store: MockServerStore
+    @ObservedObject private var store: ServerStore
     @State private var editingServer: ServerConfig?
     @State private var showingAddSheet = false
     @State private var importCandidates: [ServerConfig]?
     @State private var showImportSheet = false
 
-    init(store: MockServerStore) {
+    init(store: ServerStore) {
         self.store = store
     }
 
@@ -60,7 +60,7 @@ struct ServerSidebar: View {
         switch state {
         case .disconnected, .failed:
             Button {
-                store.toggleConnection(server.id)
+                env.toggleConnection(server.id)
             } label: {
                 Label("连接", systemImage: "link")
             }
@@ -72,7 +72,7 @@ struct ServerSidebar: View {
             }
         case .connected:
             Button {
-                store.toggleConnection(server.id)
+                env.toggleConnection(server.id)
             } label: {
                 Label("断开", systemImage: "link.badge.plus")
             }

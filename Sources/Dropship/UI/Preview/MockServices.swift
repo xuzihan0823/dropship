@@ -19,70 +19,24 @@ final class MockServerStore: ObservableObject, @unchecked Sendable {
     @Published var states: [UUID: ConnectionState]
 
     init() {
+        // 实验用单台服务器。其余演示服务器已移除，避免误连。
         let tencent = ServerConfig(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
             alias: "tencent-dev",
             displayName: "腾讯云开发机",
-            hostname: "43.130.228.225",
+            hostname: "106.54.40.65",
             port: 22,
             username: "root",
-            identityFile: "~/.ssh/id_ed25519",
+            identityFile: "/Users/mac/Desktop/密钥/shanghai.pem",
             proxyJump: nil,
             source: .sshConfig,
             defaultRemotePath: "/root",
             favorites: ["/root", "/var/log", "/etc"]
         )
-        let aliyun = ServerConfig(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
-            alias: "aliyun02",
-            displayName: "阿里云 02",
-            hostname: "8.155.16.81",
-            port: 22,
-            username: "root",
-            identityFile: "~/.ssh/id_ed25519",
-            source: .sshConfig,
-            defaultRemotePath: "/root",
-            favorites: ["/root"]
-        )
-        let tokyo = ServerConfig(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!,
-            alias: "tokyo-server",
-            displayName: "东京节点",
-            hostname: "43.160.200.14",
-            port: 22,
-            username: "ubuntu",
-            source: .sshConfig
-        )
-        let gpu = ServerConfig(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!,
-            alias: "gpu-box",
-            displayName: "GPU 训练机",
-            hostname: "10.0.1.42",
-            port: 22,
-            username: "trainer",
-            identityFile: "~/.ssh/gpu_key",
-            proxyJump: "tencent-dev",
-            source: .manual,
-            defaultRemotePath: "/data",
-            favorites: ["/data", "/data/checkpoints"]
-        )
-        let nas = ServerConfig(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!,
-            alias: "backup-nas",
-            displayName: "家庭 NAS",
-            hostname: "192.168.1.100",
-            port: 22,
-            username: "nas",
-            source: .manual
-        )
 
-        self.servers = [tencent, aliyun, tokyo, gpu, nas]
+        self.servers = [tencent]
         self.states = [
             tencent.id: .connected(transport: .agent),
-            aliyun.id: .connected(transport: .sftp),
-            tokyo.id: .failed("Connection refused (port 22)"),
-            gpu.id: .connecting,
-            nas.id: .disconnected,
         ]
     }
 

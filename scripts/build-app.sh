@@ -46,6 +46,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticTermination</key><true/>
+    <!-- 关闭窗口状态恢复：进程被强杀后，损坏的状态记录会让
+         NSPersistentUIRestorer 在启动时死等，表现为窗口永不出现 -->
+    <key>NSQuitAlwaysKeepsWindows</key><false/>
 </dict>
 </plist>
 PLIST

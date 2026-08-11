@@ -159,7 +159,10 @@ struct LocalFilePanel: View {
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
                     },
-                    onDrop: { urls in handleMoveInto(urls) }
+                    onDrop: { urls in handleMoveInto(urls) },
+                    onDropInto: { urls, row in
+                        handleMoveInto(urls, into: URL(fileURLWithPath: row.path))
+                    }
                 )
                 if case .loading = vm.status {
                     ProgressView().controlSize(.regular)
@@ -252,9 +255,10 @@ struct LocalFilePanel: View {
 
     // MARK: - 操作
 
-    private func handleMoveInto(_ urls: [URL]) {
-        // Finder 拖入本地面板：把文件移入当前目录
-        let dest = vm.url
+    /// destDir 为 nil 时落到当前目录；拖到某个目录行上时传入该行路径。
+    private func handleMoveInto(_ urls: [URL], into destDir: URL? = nil) {
+        // Finder 拖入本地面板：把文件移入目标目录
+        let dest = destDir ?? vm.url
         let fm = FileManager.default
         for u in urls {
             let target = dest.appendingPathComponent(u.lastPathComponent)

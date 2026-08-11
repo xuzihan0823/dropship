@@ -4,15 +4,16 @@ import Combine
 // ============================================================
 // 应用环境：UI 层的服务容器。
 //
-// 当前实现默认用 Mock 服务驱动界面。Core 实现就绪后，
-// 只需替换这里三个属性的构造，UI 代码无需改动。
+// 已接入真实 Core：SSH 会话、agent 自动部署、传输队列。
+// 连接编排放在这里 —— ServerStore 只存状态，实际连接由
+// RemoteFileServiceImpl 完成，两者由本类协调。
 // ============================================================
 
 @MainActor
 final class AppEnvironment: ObservableObject {
-    let serverStore: MockServerStore
-    let remoteFiles: MockRemoteFileService
-    let transferQueue: MockTransferQueue
+    let serverStore: ServerStore
+    let remoteFiles: RemoteFileServiceImpl
+    let transferQueue: TransferQueue
 
     /// 当前选中的服务器。nil 表示未选中。
     @Published var selectedServerID: UUID?
@@ -24,24 +25,32 @@ final class AppEnvironment: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
 
     init() {
-        let store = MockServerStore()
-        let queue = MockTransferQueue()
-        let remote = MockRemoteFileService()
+        let store = ServerStore()
+        let remote = RemoteFileServiceImpl()
+        let queue = TransferQueue(service: remote)
         self.serverStore = store
         self.remoteFiles = remote
         self.transferQueue = queue
-        // 默认选中第一台已连接的服务器
+
+        // 首次启动且本地无配置时，从 ~/.ssh/config 导入实验用服务器。
+        // 只导入这一台，避免误连其它机器。
+        if store.servers.isEmpty {
+            if let parsed = try? store.parseSSHConfig(),
+               let target = parsed.first(where: {
+                   $0.hostname == "106.54.40.65" && $0.username == "root"
+               }) {
+                store.add(target)
+                try? store.save()
+            }
+        }
         self.selectedServerID = store.servers.first?.id
 
-        // 转发子对象的变化到自身，这样所有观察 env 的视图都能更新
-        store.$servers
-            .sink { [weak self] _ in Task { @MainActor in self?.objectWillChange.send() } }
+        // 子对象任一 @Published 变化都转发给自身，驱动所有观察 env 的视图刷新
+        store.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
-        store.$states
-            .sink { [weak self] _ in Task { @MainActor in self?.objectWillChange.send() } }
-            .store(in: &cancellables)
-        queue.$tasks
-            .sink { [weak self] _ in Task { @MainActor in self?.objectWillChange.send() } }
+        queue.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
 
@@ -55,5 +64,51 @@ final class AppEnvironment: ObservableObject {
     var selectedConnectionState: ConnectionState {
         guard let id = selectedServerID else { return .disconnected }
         return serverStore.connectionState(of: id)
+    }
+
+    /// 连接 / 断开。连接过程包含 agent 探测与自动部署，失败时自动降级为 SFTP。
+    func toggleConnection(_ id: UUID) {
+        guard let server = serverStore.servers.first(where: { $0.id == id }) else { return }
+
+        switch serverStore.connectionState(of: id) {
+        case .connecting:
+            return  // 进行中，忽略重复点击
+
+        case .connected:
+            serverStore.setState(.disconnected, for: id)
+            Task { await remoteFiles.disconnect(id) }
+
+        case .disconnected, .failed:
+            serverStore.setState(.connecting, for: id)
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let mode = try await self.remoteFiles.connect(server)
+                    self.serverStore.setState(.connected(transport: mode), for: id)
+                } catch {
+                    self.serverStore.setState(.failed(Self.describe(error)), for: id)
+                }
+            }
+        }
+    }
+
+    /// 把底层错误转成一句能看懂的话。
+    static func describe(_ error: Error) -> String {
+        if let t = error as? TransferError {
+            return t.message.isEmpty ? t.code : t.message
+        }
+        return error.localizedDescription
+    }
+
+    private var didAutoConnect = false
+
+    /// 启动后自动连接当前选中的服务器，只触发一次。
+    /// 已连接或正在连接时不重复发起。
+    func autoConnectIfNeeded() {
+        guard !didAutoConnect, let id = selectedServerID else { return }
+        didAutoConnect = true
+        if case .disconnected = serverStore.connectionState(of: id) {
+            toggleConnection(id)
+        }
     }
 }

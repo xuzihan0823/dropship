@@ -59,9 +59,14 @@ struct FileTableView: View {
 
     let onOpen: (FileRow) -> Void
     let onContextMenu: ([FileRow]) -> AnyView
+    /// 投放到面板空白处＝落到当前目录。
     let onDrop: (([URL]) -> Void)?
+    /// 投放到某个目录行上＝直接落到那个子目录。
+    let onDropInto: (([URL], FileRow) -> Void)?
 
     @State private var isDropTargeted = false
+    /// 当前被拖拽悬停的目录行，用于高亮。
+    @State private var dropTargetRowID: String?
 
     var body: some View {
         Table(entries, selection: $selection, sortOrder: $sortOrder) {
@@ -129,7 +134,7 @@ struct FileTableView: View {
 
     @ViewBuilder
     private func nameCell(_ row: FileRow) -> some View {
-        HStack(spacing: 8) {
+        let cell = HStack(spacing: 8) {
             Image(systemName: FileIcon.symbol(for: row.name, isDir: row.isDir))
                 .font(.body)
                 .foregroundStyle(FileIcon.tint(for: row.name, isDir: row.isDir) ?? .secondary)
@@ -151,6 +156,40 @@ struct FileTableView: View {
         .contentShape(Rectangle())
         .onTapGesture(count: 2) {
             onOpen(row)
+        }
+
+        // 目录行本身就是投放目标：拖到某个文件夹上，直接传进那个文件夹，
+        // 不必先双击进去。非目录行不拦截，让事件落到整张表格＝传到当前目录。
+        if row.isDir, let onDropInto {
+            cell
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.accentColor.opacity(dropTargetRowID == row.id ? 0.30 : 0))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .strokeBorder(
+                            Color.accentColor,
+                            lineWidth: dropTargetRowID == row.id ? 1.5 : 0
+                        )
+                )
+                .dropDestination(for: URL.self) { urls, _ in
+                    dropTargetRowID = nil
+                    guard !urls.isEmpty else { return false }
+                    onDropInto(urls, row)
+                    return true
+                } isTargeted: { targeted in
+                    withAnimation(.easeInOut(duration: 0.1)) {
+                        if targeted {
+                            dropTargetRowID = row.id
+                        } else if dropTargetRowID == row.id {
+                            dropTargetRowID = nil
+                        }
+                    }
+                }
+        } else {
+            cell
         }
     }
 

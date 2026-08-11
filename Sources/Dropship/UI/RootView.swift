@@ -29,7 +29,7 @@ struct RootView: View {
                 ToolbarItemGroup(placement: .navigation) {
                     if let server = env.selectedServer {
                         Button {
-                            env.serverStore.toggleConnection(server.id)
+                            env.toggleConnection(server.id)
                         } label: {
                             Label(connectButtonTitle, systemImage: connectButtonIcon)
                         }
@@ -45,6 +45,7 @@ struct RootView: View {
         }
         // 统一在根部注入，避免某个子视图漏注入导致 EnvironmentObject 崩溃
         .environmentObject(env)
+        .onAppear { env.autoConnectIfNeeded() }
     }
 
     private var selectedTitle: String {

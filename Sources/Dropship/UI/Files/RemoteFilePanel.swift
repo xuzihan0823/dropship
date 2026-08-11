@@ -43,7 +43,7 @@ final class RemoteFileViewModel: ObservableObject {
     }
 
     func load(server: ServerConfig,
-              service: MockRemoteFileService,
+              service: RemoteFileServiceImpl,
               showHidden: Bool) {
         loadTask?.cancel()
         status = .loading
@@ -156,7 +156,8 @@ struct RemoteFilePanel: View {
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
                     },
-                    onDrop: { urls in handleUpload(urls) }
+                    onDrop: { urls in handleUpload(urls) },
+                    onDropInto: { urls, row in handleUpload(urls, into: row.path) }
                 )
                 if case .loading = vm.status {
                     ProgressView().controlSize(.regular)
@@ -283,12 +284,13 @@ struct RemoteFilePanel: View {
         vm.load(server: server, service: env.remoteFiles, showHidden: env.showHiddenFiles)
     }
 
-    private func handleUpload(_ urls: [URL]) {
+    /// remoteDir 为 nil 时落到当前目录；拖到某个目录行上时传入该行路径。
+    private func handleUpload(_ urls: [URL], into remoteDir: String? = nil) {
         guard let server = env.selectedServer else { return }
         env.transferQueue.enqueueUpload(
             localURLs: urls,
             to: server,
-            remoteDir: vm.path,
+            remoteDir: remoteDir ?? vm.path,
             policy: .ask
         )
     }

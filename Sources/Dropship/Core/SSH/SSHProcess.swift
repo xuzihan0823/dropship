@@ -1,0 +1,240 @@
+import Foundation
+
+struct ProcessResult: Sendable {
+    let status: Int32
+    let stdout: Data
+    let stderr: Data
+
+    var stdoutString: String { String(decoding: stdout, as: UTF8.self) }
+    var stderrString: String { String(decoding: stderr, as: UTF8.self) }
+}
+
+enum CoreProcessError: Error {
+    case launch(String)
+    case timedOut
+    case failed(Int32, String)
+    case cancelled
+}
+
+final class TransferCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private(set) var isCancelled = false
+
+    func attach(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let cancel = isCancelled
+        lock.unlock()
+        if cancel { process.terminate() }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let runningProcess = process
+        lock.unlock()
+        runningProcess?.terminate()
+    }
+}
+
+final class SSHProcessRunner: @unchecked Sendable {
+    static let shared = SSHProcessRunner()
+
+    let controlDirectory: URL
+
+    init(fileManager: FileManager = .default) {
+        controlDirectory = URL(fileURLWithPath: "/tmp/dropship-\(getuid())", isDirectory: true)
+        try? fileManager.createDirectory(
+            at: controlDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
+    func sshArguments(for server: ServerConfig, command: String? = nil) -> [String] {
+        var arguments = [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=600",
+            "-o", "ControlPath=\(controlDirectory.path)/control-%C",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "ConnectTimeout=10"
+        ]
+        if server.port != 22 { arguments += ["-p", String(server.port)] }
+        if let identity = server.identityFile, !identity.isEmpty {
+            arguments += ["-i", NSString(string: identity).expandingTildeInPath]
+        }
+        if let jump = server.proxyJump, !jump.isEmpty { arguments += ["-J", jump] }
+        let host = server.source == .sshConfig ? server.alias : server.hostname
+        arguments.append(server.username.isEmpty ? host : "\(server.username)@\(host)")
+        if let command { arguments.append(command) }
+        return arguments
+    }
+
+    func runSSH(server: ServerConfig, command: String, input: Data? = nil, timeout: TimeInterval = 30) async throws -> ProcessResult {
+        try await run(
+            executable: "/usr/bin/ssh",
+            arguments: sshArguments(for: server, command: command),
+            input: input,
+            timeout: timeout
+        )
+    }
+
+    func run(executable: String, arguments: [String], input: Data? = nil, timeout: TimeInterval = 30) async throws -> ProcessResult {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try self.runBlocking(executable, arguments, input, timeout))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func runBlocking(_ executable: String, _ arguments: [String], _ input: Data?, _ timeout: TimeInterval) throws -> ProcessResult {
+        let process = Process()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do { try process.run() } catch { throw CoreProcessError.launch(error.localizedDescription) }
+
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var output = Data()
+        var errors = Data()
+        func drain(_ handle: FileHandle, outputStream: Bool) {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let data = handle.readDataToEndOfFile()
+                lock.lock()
+                if outputStream { output = data } else { errors = data }
+                lock.unlock()
+                group.leave()
+            }
+        }
+        drain(stdout.fileHandleForReading, outputStream: true)
+        drain(stderr.fileHandleForReading, outputStream: false)
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            if let input { try? stdin.fileHandleForWriting.write(contentsOf: input) }
+            try? stdin.fileHandleForWriting.close()
+            group.leave()
+        }
+
+        let deadline = DispatchTime.now() + timeout
+        while process.isRunning && DispatchTime.now() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if process.isRunning {
+            process.terminate()
+            Thread.sleep(forTimeInterval: 0.2)
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+            group.wait()
+            throw CoreProcessError.timedOut
+        }
+        process.waitUntilExit()
+        group.wait()
+        return ProcessResult(status: process.terminationStatus, stdout: output, stderr: errors)
+    }
+
+    func streamUpload(server: ServerConfig, command: String, source: URL, offset: Int64, cancellation: TransferCancellation, progress: @escaping @Sendable (Int64) -> Void) async throws {
+        let started = try start(server, command, cancellation)
+        let sourceHandle = try FileHandle(forReadingFrom: source)
+        defer { try? sourceHandle.close() }
+        try sourceHandle.seek(toOffset: UInt64(offset))
+        var sent = offset
+        while !cancellation.isCancelled {
+            let data = try sourceHandle.read(upToCount: 262_144) ?? Data()
+            if data.isEmpty { break }
+            try started.input.fileHandleForWriting.write(contentsOf: data)
+            sent += Int64(data.count)
+            progress(sent)
+        }
+        try? started.input.fileHandleForWriting.close()
+        started.process.waitUntilExit()
+        let errors = started.error.fileHandleForReading.readDataToEndOfFile()
+        if cancellation.isCancelled { throw CoreProcessError.cancelled }
+        guard started.process.terminationStatus == 0 else {
+            throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
+        }
+    }
+
+    func streamDownload(server: ServerConfig, command: String, destination: URL, offset: Int64, cancellation: TransferCancellation, progress: @escaping @Sendable (Int64) -> Void) async throws {
+        let started = try start(server, command, cancellation)
+        try? started.input.fileHandleForWriting.close()
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            FileManager.default.createFile(atPath: destination.path, contents: nil)
+        }
+        let destinationHandle = try FileHandle(forWritingTo: destination)
+        defer { try? destinationHandle.close() }
+        if offset == 0 { try destinationHandle.truncate(atOffset: 0) }
+        try destinationHandle.seek(toOffset: UInt64(offset))
+        var received = offset
+        while !cancellation.isCancelled {
+            let data = try started.output.fileHandleForReading.read(upToCount: 262_144) ?? Data()
+            if data.isEmpty { break }
+            try destinationHandle.write(contentsOf: data)
+            received += Int64(data.count)
+            progress(received)
+        }
+        started.process.waitUntilExit()
+        let errors = started.error.fileHandleForReading.readDataToEndOfFile()
+        if cancellation.isCancelled { throw CoreProcessError.cancelled }
+        guard started.process.terminationStatus == 0 else {
+            throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
+        }
+    }
+
+    private struct Started { let process: Process; let input: Pipe; let output: Pipe; let error: Pipe }
+    private func start(_ server: ServerConfig, _ command: String, _ cancellation: TransferCancellation) throws -> Started {
+        let process = Process(), input = Pipe(), output = Pipe(), error = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = sshArguments(for: server, command: command)
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = error
+        do { try process.run() } catch { throw CoreProcessError.launch(error.localizedDescription) }
+        cancellation.attach(process)
+        return Started(process: process, input: input, output: output, error: error)
+    }
+}
+
+func shellQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+func transferError(from error: Error) -> TransferError {
+    if let error = error as? TransferError { return error }
+    if case CoreProcessError.cancelled = error {
+        return TransferError(code: "ECANCELLED", message: "Transfer cancelled")
+    }
+
+    let message = String(describing: error)
+    let knownCodes = [
+        "ESIZE", "EHASH", "ENOENT", "EACCES", "EEXIST", "ENOSPC",
+        "EISDIR", "ENOTDIR", "EPROTO", "EINTERNAL"
+    ]
+    let code: String
+    if let protocolCode = knownCodes.first(where: { message.contains($0) }) {
+        code = protocolCode
+    } else if message.localizedCaseInsensitiveContains("No such file") {
+        code = "ENOENT"
+    } else if message.localizedCaseInsensitiveContains("Permission denied") {
+        code = "EACCES"
+    } else if message.localizedCaseInsensitiveContains("No space left") {
+        code = "ENOSPC"
+    } else {
+        code = "EINTERNAL"
+    }
+    return TransferError(
+        code: code,
+        message: message,
+        retryable: ["ESIZE", "EHASH", "EINTERNAL"].contains(code)
+    )
+}

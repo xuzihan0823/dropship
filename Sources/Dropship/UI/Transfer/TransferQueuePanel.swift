@@ -6,9 +6,9 @@ import SwiftUI
 
 struct TransferQueuePanel: View {
     @EnvironmentObject private var env: AppEnvironment
-    @ObservedObject private var queue: MockTransferQueue
+    @ObservedObject private var queue: TransferQueue
 
-    init(queue: MockTransferQueue) {
+    init(queue: TransferQueue) {
         self.queue = queue
     }
 
@@ -168,8 +168,7 @@ struct TransferQueuePanel: View {
             }
         case .completed, .skipped, .cancelled:
             Button(role: .destructive) {
-                queue.tasks.removeAll { $0.id == task.id }
-                queue.objectWillChange.send()
+                queue.removeTask(task.id)
             } label: {
                 Label("移除", systemImage: "trash")
             }
