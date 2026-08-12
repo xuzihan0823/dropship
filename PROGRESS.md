@@ -56,6 +56,59 @@ ssh <host> '~/.local/share/dropship/agent --version'
 
 ## 质量记录
 
+### 新增：反向收件隧道，服务器可以主动把文件推回 Mac（2026-08-12）
+
+在此之前 Dropship 是单向发起的：Mac 主动 ssh 出去，服务器没有任何办法把文件送回来。
+跑在服务器上的 AI agent 产出构建产物或报告后，只能等人回到 Mac 上手动下载。
+
+现在每台服务器多了一个**收件隧道开关**。打开后：
+
+```
+Mac: Dropship.app 内置收件端点 (127.0.0.1:随机端口，仅回环)
+      ▲  ssh -N -R 0:127.0.0.1:<本地端口>   ← Mac 发起并常驻，断了按退避重连
+服务器: 127.0.0.1:<远端口>  ←── curl ←── 服务器上的 agent
+```
+
+服务器那头的用法就一行，脚本由 App 在隧道建立时自动写入：
+
+```sh
+~/.local/share/dropship/dropship-send ./build/report.pdf
+~/.local/share/dropship/dropship-send ./logs/          # 目录自动打包成 logs.tar.gz
+```
+
+推回来的文件落在 `~/Desktop/Dropship`，同时出现在底部面板新增的「收件箱」分页里。
+
+**为什么不直接把 Mac 的 sshd 反向转发出去**（远程登录本来就开着，scp 一步到位）：
+那需要把一把能登录 Mac 的私钥放到服务器上，服务器被入侵就等于 Mac 被入侵。
+选了 App 内置收件端点后，服务器上**不存放任何能登录 Mac 的凭据**，拿到 token 的人
+只能**写**、且只能写进收件箱那一个目录，读不到 Mac 上的任何东西。
+
+关键实现点：
+
+| 点 | 处理 |
+|---|---|
+| 远端口每次重连都变 | 从 ssh stderr 解析 `Allocated port N for remote forward`，每次 active 都重写服务器上的 `inbox.env` |
+| 隧道生命周期 | 刻意**不复用** ControlMaster 共享连接（`ControlPath=none`）。挂在共享 master 上的话，master 何时退出不归我们管，还可能在服务器留下没人用的转发端口 |
+| ssh 参数覆盖顺序 | ssh 取每个参数**首次出现**的值，所以覆盖项必须排在 `sshArguments` 的基础参数**前面**，否则 `ControlPath=none` 会被忽略 |
+| 转发建不起来 | `ExitOnForwardFailure=yes`。服务器 sshd 关了 `AllowTcpForwarding` 时要立刻报错，不能留一个"连上了但其实没通"的假象 |
+| 密码提示 | `BatchMode=yes`。常驻进程卡在看不见的密码提示上，表现为永远"建立中" |
+| 截断防护 | 收到字节数必须等于 `Content-Length`，不等则**保留 `.part`、绝不 rename** —— 与 PROTOCOL.md 2.2 那次事故同一条底线 |
+| 路径穿越 | 先百分号解码再取 lastPathComponent（顺序反了 `%2F` 会解出新分隔符），`PUT /../../../../etc/passwd` 只会落成收件箱里的 `passwd` |
+| `Expect: 100-continue` | 必须先回 100。curl 对 >1KB 的 PUT body 默认发这个头，不回它每次传输白等 1 秒 |
+| ServerConfig 没加字段 | 它已 Codable 落盘在 servers.json，合成 decode 遇到缺失的非可选 key 会 throw，`ServerStore` 那句 `try?` 会静默把服务器列表清空。开关状态另存 `tunnels.json` |
+
+新增文件：`Core/Tunnel/{InboxServer,ReverseTunnel,TunnelService}.swift`、
+`Tests/DropshipTests/InboxTunnelTests.swift`；契约见 `docs/PROTOCOL.md` 第 7 节。
+`TransferQueue` 未改动 —— 它的可见任务上限与进度节流是为 3 万文件场景调过的，
+收件箱走 TunnelService 自己的轻量数组，只在 UI 上并排呈现。
+
+自动验证覆盖：鉴权（缺 token / 错 token / token 已作废）、截断保留 `.part`、
+路径穿越展平、重名不覆盖、chunked 拒绝、100-continue、ssh 端口解析、
+参数覆盖顺序、ssh 立即退出触发退避重连。
+
+**待你在 Mac 上执行**：`swift build && swift test && ./scripts/build-app.sh`，
+以及真机端到端（开开关 → 服务器执行 dropship-send → 比对 md5 → 关开关后应立刻失败）。
+
 ### 大文件拖入远程区域卡死/退出修复（2026-08-12）
 
 现象是普通大文件拖入服务器区域后先卡住再退出，但 `.zip` 等压缩包可正常上传。

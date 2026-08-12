@@ -8,20 +8,26 @@ import AppKit
 struct ServerSidebar: View {
     @EnvironmentObject private var env: AppEnvironment
     @ObservedObject private var store: ServerStore
+    @ObservedObject private var tunnels: TunnelService
     @State private var editingServer: ServerConfig?
     @State private var showingAddSheet = false
     @State private var importCandidates: [ServerConfig]?
     @State private var showImportSheet = false
 
-    init(store: ServerStore) {
+    init(store: ServerStore, tunnels: TunnelService) {
         self.store = store
+        self.tunnels = tunnels
     }
 
     var body: some View {
         List(selection: $env.selectedServerID) {
             Section {
                 ForEach(store.servers) { server in
-                    ServerRow(server: server, state: store.connectionState(of: server.id))
+                    ServerRow(
+                        server: server,
+                        state: store.connectionState(of: server.id),
+                        tunnel: tunnels.state(of: server.id)
+                    )
                         .tag(server.id)
                         .contextMenu {
                             contextMenu(for: server)
@@ -78,6 +84,8 @@ struct ServerSidebar: View {
             }
         }
         Divider()
+        tunnelMenu(for: server)
+        Divider()
         Button {
             editingServer = server
         } label: {
@@ -98,6 +106,44 @@ struct ServerSidebar: View {
             Label("删除", systemImage: "trash")
         }
         .disabled(server.source == .sshConfig)
+    }
+
+    /// 反向收件隧道的开关与便捷命令。这是让服务器上的 agent 把文件推回 Mac 的入口。
+    @ViewBuilder
+    private func tunnelMenu(for server: ServerConfig) -> some View {
+        let enabled = tunnels.isEnabled(server.id)
+        Button {
+            env.toggleTunnel(server.id)
+        } label: {
+            Label(
+                enabled ? "关闭收件隧道" : "开启收件隧道",
+                systemImage: enabled ? "arrow.down.circle.fill" : "arrow.down.circle"
+            )
+        }
+
+        if case .active(let remotePort) = tunnels.state(of: server.id) {
+            Button {
+                copyToPasteboard(TunnelService.sendCommand)
+            } label: {
+                Label("拷贝服务器端推送命令", systemImage: "terminal")
+            }
+            Text("服务器 127.0.0.1:\(remotePort) → 本机收件箱")
+        }
+
+        Button {
+            #if canImport(AppKit)
+            _ = NSWorkspace.shared.open(tunnels.inboxDirectory)
+            #endif
+        } label: {
+            Label("打开收件箱目录", systemImage: "tray.and.arrow.down")
+        }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        #endif
     }
 
     @ViewBuilder
@@ -135,6 +181,7 @@ struct ServerSidebar: View {
 private struct ServerRow: View {
     let server: ServerConfig
     let state: ConnectionState
+    let tunnel: TunnelState
 
     var body: some View {
         HStack(spacing: 10) {
@@ -150,12 +197,59 @@ private struct ServerRow: View {
                             .foregroundStyle(.secondary)
                             .help("来自 ~/.ssh/config")
                     }
+                    tunnelBadge
                 }
                 subtitle
+                tunnelSubtitle
             }
             Spacer()
         }
         .padding(.vertical, 2)
+    }
+
+    /// 隧道开着才显示。用向下的箭头区别于上传方向。
+    @ViewBuilder
+    private var tunnelBadge: some View {
+        switch tunnel {
+        case .disabled:
+            EmptyView()
+        case .starting:
+            Image(systemName: "arrow.down.circle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .help("收件隧道建立中…")
+        case .active(let remotePort):
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(Color.accentColor)
+                .help("收件隧道已通 · 服务器 127.0.0.1:\(remotePort)")
+        case .failed:
+            Image(systemName: "exclamationmark.circle")
+                .font(.caption2)
+                .foregroundStyle(Color.red)
+                .help("收件隧道未连通")
+        }
+    }
+
+    @ViewBuilder
+    private var tunnelSubtitle: some View {
+        switch tunnel {
+        case .disabled:
+            EmptyView()
+        case .starting:
+            Text("收件隧道建立中…")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        case .active(let remotePort):
+            Text("收件隧道 · 服务器端口 \(remotePort)")
+                .font(.caption2)
+                .foregroundStyle(Color.accentColor)
+        case .failed(let message):
+            Text("收件隧道：\(message)")
+                .font(.caption2)
+                .foregroundStyle(Color.red)
+                .lineLimit(2)
+        }
     }
 
     @ViewBuilder

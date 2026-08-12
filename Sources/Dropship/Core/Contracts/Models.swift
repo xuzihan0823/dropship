@@ -206,3 +206,49 @@ public enum ConflictPolicy: String, Sendable {
     case skip       // 跳过
     case rename     // 自动重命名为 name-1.ext
 }
+
+// MARK: - 反向收件隧道
+
+/// 一台服务器的反向隧道状态。
+///
+/// Mac 在 NAT 后面，服务器无法主动连进来，因此由 Mac 侧发起 `ssh -R`，
+/// 把服务器的 `127.0.0.1:<remotePort>` 反向转发到 App 内置的收件端点。
+public enum TunnelState: Equatable, Sendable {
+    case disabled
+    case starting
+    /// 已建立。remotePort 是服务器上回环地址的端口，写进服务器的 inbox.env 供 agent 使用。
+    case active(remotePort: Int)
+    case failed(String)
+
+    public var isActive: Bool {
+        if case .active = self { return true }
+        return false
+    }
+}
+
+/// 服务器推回来的一个文件。由 TunnelService 维护，只增不改。
+public struct InboxItem: Identifiable, Sendable, Equatable {
+    public let id: UUID
+    /// 推送方。靠 token 区分，每台服务器一把。
+    public let serverID: UUID
+    public let filename: String
+    public let url: URL
+    public let bytes: Int64
+    public let receivedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        serverID: UUID,
+        filename: String,
+        url: URL,
+        bytes: Int64,
+        receivedAt: Date = Date()
+    ) {
+        self.id = id
+        self.serverID = serverID
+        self.filename = filename
+        self.url = url
+        self.bytes = bytes
+        self.receivedAt = receivedAt
+    }
+}

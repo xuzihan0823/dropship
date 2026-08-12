@@ -178,3 +178,112 @@ agent --send --path <源绝对路径> [--offset N] [--compress gzip]
 4. **不写日志文件**：不得在服务器上产生任何日志或临时残留（`.part` 文件除外）
 5. **信号处理**：收到 SIGTERM/SIGPIPE 时干净退出，保留 `.part` 以便续传
 6. **哈希算法**：blake3（比 sha256 快数倍，上行受限场景下不应让 CPU 成为新瓶颈）
+
+---
+
+## 7. 反向收件隧道（服务器 → Mac 主动推送）
+
+第 1–6 节描述的都是 **Mac 发起**的通路。本节是反过来的那条：让服务器上的进程
+（尤其是跑在服务器上的 AI agent）主动把文件推回 Mac。
+
+Go agent **不参与**这条通路，本节不对 agent 提任何要求。
+
+### 7.1 为什么要有隧道
+
+Mac 在 NAT 后面，没有公网地址，服务器无法主动连进来。因此通路仍然由 Mac 发起：
+
+```
+Mac: Dropship.app 内置收件端点 (127.0.0.1:<localPort>，仅回环)
+      ▲
+      │ ssh -N -R 0:127.0.0.1:<localPort>     ← 由 Mac 发起并常驻
+      │
+服务器: 127.0.0.1:<remotePort>  ←── curl ←── 服务器上的 agent
+```
+
+`remotePort` 由服务器的 sshd 动态分配，ssh 客户端从 stderr 的
+`Allocated port <N> for remote forward` 中解析。**每次重连都可能变**，所以
+客户端每次隧道建立成功都会重写一遍服务器上的 `inbox.env`。
+
+`ssh -R` 默认只在服务器的回环地址绑定（`GatewayPorts no`），公网碰不到这个端口。
+
+### 7.2 服务器端的两个文件
+
+隧道开启时由 Mac 写入，关闭时删除。目录与 agent 相同：
+
+| 路径 | 权限 | 内容 |
+|---|---|---|
+| `$HOME/.local/share/dropship/inbox.env` | `0600` | `DROPSHIP_INBOX_URL` + `DROPSHIP_INBOX_TOKEN` |
+| `$HOME/.local/share/dropship/dropship-send` | `0755` | curl 包装脚本 |
+
+于是服务器上的调用方只需要一行：
+
+```sh
+~/.local/share/dropship/dropship-send ./build/report.pdf
+~/.local/share/dropship/dropship-send ./logs/          # 目录自动打包成 logs.tar.gz
+```
+
+脚本不存在即表示隧道没开，它会直接报错退出，不会静默失败。
+
+### 7.3 收件端点契约
+
+```
+PUT /upload HTTP/1.1
+Authorization: Bearer <token>
+X-Dropship-Name: <base64(UTF-8 文件名)>
+Content-Length: <N>
+
+<裸二进制，N 字节>
+```
+
+| 项 | 约定 |
+|---|---|
+| 方法 | 只接受 `PUT` / `POST`，其余 405 |
+| 鉴权 | `Authorization: Bearer <token>`，定长时间比对，失败 401。**每台服务器一把 token**，token 即身份 |
+| 文件名 | 优先 `X-Dropship-Name`（base64，避开空格与中文在请求行里被切断）；缺失时退回请求路径的最后一段 |
+| 长度 | **必须**带 `Content-Length`。`Transfer-Encoding: chunked` 一律 411 —— 目录请先打包成文件再传 |
+| `Expect: 100-continue` | 服务端会先回 `HTTP/1.1 100 Continue`。curl 对 >1KB 的 PUT body 默认发这个头，不回它每次白等 1 秒 |
+| 连接 | 不支持 keep-alive，响应后即关闭 |
+
+成功：
+```json
+{"ok":true,"name":"report.pdf","bytes":52428800}
+```
+
+失败：
+```json
+{"ok":false,"code":"ESIZE","message":"..."}
+```
+
+### 7.4 落地规则
+
+1. 流式写入 `<收件箱>/.incoming/<uuid>.part`，全程不整文件进内存
+2. 收到的字节数**必须**等于 `Content-Length`，不等即判定截断
+3. 校验通过才**原子 rename** 进收件箱；不通过则**保留 `.part`、绝不 rename**
+4. 文件名一律压成单段裸名：先百分号解码，再取最后一段，再清掉残留分隔符。
+   `PUT /../../../../etc/passwd` 只会落成收件箱里的 `passwd`
+5. 同名不覆盖，自动 `name-1.ext`
+6. 未完成的 `.part` 保留 7 天，之后在下次启动时清理
+
+> 第 2、3 条与 2.2 节 `--recv` 的规矩是同一条：那次半截文件覆盖掉服务器原文件的
+> 事故，根因就是"没校验字节数就 rename"。收件方向必须守同样的底线。
+
+### 7.5 错误码
+
+复用第 4 节的稳定值，HTTP 状态码只是外壳：
+
+| HTTP | code | 含义 |
+|---|---|---|
+| 401 | `EACCES` | token 无效，或隧道已关闭 |
+| 405 / 411 / 431 | `EPROTO` | 方法、长度声明或请求头不合约定 |
+| 413 | `EPROTO` | 超过单文件上限（8 GiB） |
+| 400 | `ESIZE` | 收到字节数与 `Content-Length` 不符，已保留 `.part` |
+| 507 | `ENOSPC` | Mac 磁盘空间不足 |
+| 500 | `EINTERNAL` | 写盘或落地失败 |
+
+### 7.6 安全边界（明确写下来，不要事后惊讶）
+
+- 收件端点**只绑 127.0.0.1**，不经过任何真实网卡，因此也不会触发 macOS 应用防火墙弹窗
+- 服务器上**不存放任何能登录 Mac 的凭据**。拿到 token 的人只能**写**，且只能写进收件箱那一个目录，读不到 Mac 上的任何东西，也拿不到执行权限
+- 反过来说：服务器上任何能读 `inbox.env` 的用户（含 root）都能往你的收件箱塞文件。这是本方案的已知边界
+- 关闭开关会同时作废 token、杀掉 ssh 进程、删掉服务器上的两个文件，三重失效
+

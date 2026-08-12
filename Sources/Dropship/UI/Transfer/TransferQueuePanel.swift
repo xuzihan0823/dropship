@@ -1,15 +1,26 @@
 import SwiftUI
+import AppKit
 
 // ============================================================
-// 传输队列面板：底部可折叠，展示所有任务。
+// 传输队列面板：底部可折叠。
+// 两个分页：「传输队列」是本机发起的上传/下载，
+// 「收件箱」是服务器通过反向隧道主动推回来的文件。
 // ============================================================
 
 struct TransferQueuePanel: View {
+    private enum Tab: Hashable {
+        case transfers
+        case inbox
+    }
+
     @EnvironmentObject private var env: AppEnvironment
     @ObservedObject private var queue: TransferQueue
+    @ObservedObject private var tunnels: TunnelService
+    @State private var tab: Tab = .transfers
 
-    init(queue: TransferQueue) {
+    init(queue: TransferQueue, tunnels: TunnelService) {
         self.queue = queue
+        self.tunnels = tunnels
     }
 
     var body: some View {
@@ -17,7 +28,10 @@ struct TransferQueuePanel: View {
             header
             if env.transferPanelExpanded {
                 Divider()
-                taskList
+                switch tab {
+                case .transfers: taskList
+                case .inbox: inboxList
+                }
             }
         }
         .background(.regularMaterial)
@@ -42,14 +56,16 @@ struct TransferQueuePanel: View {
             .buttonStyle(.borderless)
             .help(env.transferPanelExpanded ? "折叠传输队列" : "展开传输队列")
 
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.secondary)
-                Text("传输队列")
-                    .font(.headline)
+            Picker("", selection: $tab) {
+                Text("传输队列").tag(Tab.transfers)
+                Text(tunnels.inbox.isEmpty ? "收件箱" : "收件箱 \(tunnels.inbox.count)")
+                    .tag(Tab.inbox)
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 220)
 
-            if queue.taskCount > 0 {
+            if tab == .transfers, queue.taskCount > 0 {
                 Text("\(queue.activeCount) 个进行中 · \(queue.taskCount) 个任务")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -57,18 +73,38 @@ struct TransferQueuePanel: View {
 
             Spacer()
 
-            if queue.activeCount > 0 || queue.completedCount > 0 {
-                overallProgress
-            }
+            if tab == .transfers {
+                if queue.activeCount > 0 || queue.completedCount > 0 {
+                    overallProgress
+                }
 
-            Button {
-                queue.clearFinished()
-            } label: {
-                Label("清除已完成", systemImage: "checkmark.broom")
+                Button {
+                    queue.clearFinished()
+                } label: {
+                    Label("清除已完成", systemImage: "checkmark.broom")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(queue.finishedCount == 0)
+            } else {
+                Button {
+                    _ = NSWorkspace.shared.open(tunnels.inboxDirectory)
+                } label: {
+                    Label("打开收件箱", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    tunnels.clearInbox()
+                } label: {
+                    Label("清空列表", systemImage: "eraser")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(tunnels.inbox.isEmpty)
+                .help("只清列表，磁盘上的文件不动")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(queue.finishedCount == 0)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -175,6 +211,93 @@ struct TransferQueuePanel: View {
         }
     }
 
+    // MARK: - 收件箱
+
+    @ViewBuilder
+    private var inboxList: some View {
+        if tunnels.inbox.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: "tray.and.arrow.down")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("还没有收到推送")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text("开启收件隧道后，在服务器上执行 \(TunnelService.sendCommand)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(tunnels.inbox) { item in
+                        InboxRow(item: item)
+                            .onTapGesture(count: 2) {
+                                _ = NSWorkspace.shared.open(item.url)
+                            }
+                            .contextMenu {
+                                inboxContextMenu(for: item)
+                            }
+                        if item.id != tunnels.inbox.last?.id {
+                            Divider().padding(.leading, 44)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inboxContextMenu(for item: InboxItem) -> some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        } label: {
+            Label("在 Finder 中显示", systemImage: "folder")
+        }
+        Button {
+            _ = NSWorkspace.shared.open(item.url)
+        } label: {
+            Label("打开", systemImage: "arrow.up.forward.app")
+        }
+        Divider()
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.url.path, forType: .string)
+        } label: {
+            Label("拷贝路径", systemImage: "doc.on.doc")
+        }
+    }
+
+}
+
+// MARK: - 单行收件
+
+private struct InboxRow: View {
+    let item: InboxItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.down.doc")
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.filename)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(Formatters.fileSize(item.bytes)) · \(Formatters.relativeDate(item.receivedAt))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
 }
 
 // MARK: - 单行任务

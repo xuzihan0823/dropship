@@ -14,7 +14,7 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             NavigationSplitView(columnVisibility: $sidebarVisibility) {
-                ServerSidebar(store: env.serverStore)
+                ServerSidebar(store: env.serverStore, tunnels: env.tunnels)
                     .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
             } content: {
                 LocalFilePanel(queue: env.transferQueue)
@@ -34,12 +34,19 @@ struct RootView: View {
                             Label(connectButtonTitle, systemImage: connectButtonIcon)
                         }
                         .help(connectButtonTitle)
+
+                        Button {
+                            env.toggleTunnel(server.id)
+                        } label: {
+                            Label(tunnelButtonTitle, systemImage: tunnelButtonIcon)
+                        }
+                        .help(tunnelButtonHelp)
                     }
                 }
             }
 
             Divider()
-            TransferQueuePanel(queue: env.transferQueue)
+            TransferQueuePanel(queue: env.transferQueue, tunnels: env.tunnels)
                 .environmentObject(env)
                 .frame(height: env.transferPanelExpanded ? 220 : 38)
         }
@@ -69,6 +76,40 @@ struct RootView: View {
         case .disconnected, .failed: return "link"
         case .connecting: return "arrow.triangle.2.circlepath"
         case .connected: return "link.badge.plus"
+        }
+    }
+
+    // MARK: - 收件隧道
+
+    private var tunnelState: TunnelState {
+        guard let server = env.selectedServer else { return .disabled }
+        return env.tunnels.state(of: server.id)
+    }
+
+    private var tunnelButtonTitle: String {
+        guard let server = env.selectedServer else { return "" }
+        return env.tunnels.isEnabled(server.id) ? "关闭收件隧道" : "开启收件隧道"
+    }
+
+    private var tunnelButtonIcon: String {
+        switch tunnelState {
+        case .disabled: return "arrow.down.circle"
+        case .starting: return "arrow.triangle.2.circlepath"
+        case .active: return "arrow.down.circle.fill"
+        case .failed: return "exclamationmark.circle"
+        }
+    }
+
+    private var tunnelButtonHelp: String {
+        switch tunnelState {
+        case .disabled:
+            return "开启后服务器可以主动把文件推回这台 Mac"
+        case .starting:
+            return "收件隧道建立中…"
+        case .active(let remotePort):
+            return "已通 · 服务器上执行 \(TunnelService.sendCommand)（回环端口 \(remotePort)）"
+        case .failed(let message):
+            return "收件隧道：\(message)"
         }
     }
 }

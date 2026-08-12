@@ -14,6 +14,8 @@ final class AppEnvironment: ObservableObject {
     let serverStore: ServerStore
     let remoteFiles: RemoteFileServiceImpl
     let transferQueue: TransferQueue
+    /// 反向收件隧道：服务器往 Mac 推文件的通路，每台服务器一个开关。
+    let tunnels: TunnelService
 
     /// 当前选中的服务器。nil 表示未选中。
     @Published var selectedServerID: UUID?
@@ -31,6 +33,7 @@ final class AppEnvironment: ObservableObject {
         self.serverStore = store
         self.remoteFiles = remote
         self.transferQueue = queue
+        self.tunnels = TunnelService()
 
         // 首次启动且本地无配置时，从 ~/.ssh/config 导入实验用服务器。
         // 只导入这一台，避免误连其它机器。
@@ -74,6 +77,9 @@ final class AppEnvironment: ObservableObject {
             return  // 进行中，忽略重复点击
 
         case .connected:
+            // 先停隧道再断连接：此刻 SSH 主连接还在，能顺手把服务器上的
+            // inbox.env 删掉，不留一份指向死端口的配置。
+            tunnels.suspend(id)
             serverStore.setState(.disconnected, for: id)
             Task { await remoteFiles.disconnect(id) }
 
@@ -84,6 +90,8 @@ final class AppEnvironment: ObservableObject {
                 do {
                     let mode = try await self.remoteFiles.connect(server)
                     self.serverStore.setState(.connected(transport: mode), for: id)
+                    // 开关记着是开的就把隧道拉起来
+                    self.tunnels.resumeIfEnabled(server)
                 } catch {
                     self.serverStore.setState(.failed(Self.describe(error)), for: id)
                 }
@@ -97,6 +105,15 @@ final class AppEnvironment: ObservableObject {
             return t.message.isEmpty ? t.code : t.message
         }
         return error.localizedDescription
+    }
+
+    /// 拨动某台服务器的反向收件隧道。
+    ///
+    /// 隧道自己起独立的 ssh 连接，不依赖上面的"已连接"状态，
+    /// 所以没连上也能开 —— 只要 SSH 能登录就行。
+    func toggleTunnel(_ id: UUID) {
+        guard let server = serverStore.servers.first(where: { $0.id == id }) else { return }
+        tunnels.setEnabled(!tunnels.isEnabled(id), for: server)
     }
 
     private var didAutoConnect = false
