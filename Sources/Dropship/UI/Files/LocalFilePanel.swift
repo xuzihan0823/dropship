@@ -100,9 +100,14 @@ final class LocalFileViewModel: ObservableObject {
 struct LocalFilePanel: View {
     @StateObject private var vm = LocalFileViewModel()
     @EnvironmentObject private var env: AppEnvironment
+    @ObservedObject private var queue: TransferQueue
     @State private var showNewFolder = false
     @State private var newFolderName = ""
     @State private var confirmDelete: [FileRow]?
+
+    init(queue: TransferQueue) {
+        self.queue = queue
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -113,6 +118,10 @@ struct LocalFilePanel: View {
         .background(Color(nsColor: .textBackgroundColor).opacity(0.4))
         .toolbar { toolbar }
         .onAppear {
+            vm.reload()
+        }
+        // 下载结束后自动刷新，否则刚取回的文件不会出现在列表里
+        .onChange(of: finishedTransferSignature) { _, _ in
             vm.reload()
         }
         .alert("新建文件夹", isPresented: $showNewFolder) {
@@ -158,6 +167,9 @@ struct LocalFilePanel: View {
                     onOpen: { row in vm.openEntry(row) },
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
+                    },
+                    dragProviderForRow: { row in
+                        NSItemProvider(object: URL(fileURLWithPath: row.path) as NSURL)
                     },
                     onDrop: { urls in handleMoveInto(urls) },
                     onDropInto: { urls, row in
@@ -256,6 +268,11 @@ struct LocalFilePanel: View {
     // MARK: - 操作
 
     /// destDir 为 nil 时落到当前目录；拖到某个目录行上时传入该行路径。
+    /// 已结束传输的指纹。任一任务进入完成/跳过状态，指纹变化，触发列表刷新。
+    private var finishedTransferSignature: Int {
+        queue.finishedTransferRevision
+    }
+
     private func handleMoveInto(_ urls: [URL], into destDir: URL? = nil) {
         // Finder 拖入本地面板：把文件移入目标目录
         let dest = destDir ?? vm.url

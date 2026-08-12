@@ -17,11 +17,11 @@ struct RootView: View {
                 ServerSidebar(store: env.serverStore)
                     .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
             } content: {
-                LocalFilePanel()
+                LocalFilePanel(queue: env.transferQueue)
                     .environmentObject(env)
                     .navigationSplitViewColumnWidth(min: 280, ideal: 420)
             } detail: {
-                RemoteFilePanel()
+                RemoteFilePanel(queue: env.transferQueue)
                     .environmentObject(env)
             }
             .navigationTitle(selectedTitle)

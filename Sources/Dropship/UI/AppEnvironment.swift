@@ -45,11 +45,10 @@ final class AppEnvironment: ObservableObject {
         }
         self.selectedServerID = store.servers.first?.id
 
-        // 子对象任一 @Published 变化都转发给自身，驱动所有观察 env 的视图刷新
+        // Server changes affect several computed environment properties.
+        // TransferQueuePanel observes the queue directly; forwarding every
+        // progress tick here would redraw both file browsers as well.
         store.objectWillChange
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
-        queue.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }

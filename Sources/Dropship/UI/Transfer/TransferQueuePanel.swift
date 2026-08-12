@@ -49,15 +49,15 @@ struct TransferQueuePanel: View {
                     .font(.headline)
             }
 
-            if !queue.tasks.isEmpty {
-                Text("\(activeCount) 个进行中 · \(queue.tasks.count) 个任务")
+            if queue.taskCount > 0 {
+                Text("\(queue.activeCount) 个进行中 · \(queue.taskCount) 个任务")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            if activeCount > 0 || completedCount > 0 {
+            if queue.activeCount > 0 || queue.completedCount > 0 {
                 overallProgress
             }
 
@@ -68,7 +68,7 @@ struct TransferQueuePanel: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(queue.tasks.allSatisfy { !isFinished($0) })
+            .disabled(queue.finishedCount == 0)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -77,8 +77,8 @@ struct TransferQueuePanel: View {
 
     @ViewBuilder
     private var overallProgress: some View {
-        let total = queue.tasks.filter { $0.totalBytes > 0 }.reduce(Int64(0)) { $0 + $1.totalBytes }
-        let done = queue.tasks.filter { $0.totalBytes > 0 }.reduce(Int64(0)) { $0 + $1.transferredBytes }
+        let total = queue.totalBytes
+        let done = queue.transferredBytes
         let ratio = total > 0 ? Double(done) / Double(total) : 0
         HStack(spacing: 6) {
             Text("总体")
@@ -96,7 +96,7 @@ struct TransferQueuePanel: View {
 
     @ViewBuilder
     private var taskList: some View {
-        if queue.tasks.isEmpty {
+        if queue.taskCount == 0 {
             VStack(spacing: 6) {
                 Image(systemName: "tray")
                     .font(.title2)
@@ -110,12 +110,12 @@ struct TransferQueuePanel: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(queue.tasks) { task in
+                    ForEach(queue.visibleTasks) { task in
                         TransferRow(task: task)
                             .contextMenu {
                                 taskContextMenu(for: task)
                             }
-                        if task.id != queue.tasks.last?.id {
+                        if task.id != queue.visibleTasks.last?.id {
                             Divider().padding(.leading, 44)
                         }
                     }
@@ -156,7 +156,7 @@ struct TransferQueuePanel: View {
                 Label("重试", systemImage: "arrow.clockwise")
             }
             Button(role: .destructive) {
-                queue.cancel(task.id)
+                queue.removeTask(task.id)
             } label: {
                 Label("移除", systemImage: "trash")
             }
@@ -175,32 +175,6 @@ struct TransferQueuePanel: View {
         }
     }
 
-    // MARK: - 计算
-
-    private var activeCount: Int {
-        queue.tasks.filter {
-            switch $0.state {
-            case .transferring, .preparing, .verifying: return true
-            default: return false
-            }
-        }.count
-    }
-
-    private var completedCount: Int {
-        queue.tasks.filter {
-            switch $0.state {
-            case .completed, .skipped: return true
-            default: return false
-            }
-        }.count
-    }
-
-    private func isFinished(_ t: TransferTask) -> Bool {
-        switch t.state {
-        case .completed, .skipped, .cancelled: return true
-        default: return false
-        }
-    }
 }
 
 // MARK: - 单行任务

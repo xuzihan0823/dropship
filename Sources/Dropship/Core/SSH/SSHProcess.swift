@@ -16,6 +16,42 @@ enum CoreProcessError: Error {
     case cancelled
 }
 
+/// Continuously drains a child-process pipe so verbose progress output cannot
+/// fill the kernel buffer and deadlock the transfer. Only a bounded tail is
+/// retained because callers need the final protocol error, not every progress
+/// event from a multi-hour transfer.
+private final class ProcessPipeCollector: @unchecked Sendable {
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private let byteLimit: Int
+    private var buffered = Data()
+
+    init(handle: FileHandle, byteLimit: Int = 1_048_576) {
+        self.byteLimit = byteLimit
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            defer { group.leave() }
+            while true {
+                guard let chunk = try? handle.read(upToCount: 65_536),
+                      !chunk.isEmpty else { return }
+                lock.lock()
+                buffered.append(chunk)
+                if buffered.count > byteLimit {
+                    buffered = Data(buffered.suffix(byteLimit))
+                }
+                lock.unlock()
+            }
+        }
+    }
+
+    func waitForData() -> Data {
+        group.wait()
+        lock.lock()
+        defer { lock.unlock() }
+        return buffered
+    }
+}
+
 final class TransferCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
@@ -42,8 +78,13 @@ final class SSHProcessRunner: @unchecked Sendable {
     static let shared = SSHProcessRunner()
 
     let controlDirectory: URL
+    private let sshExecutableURL: URL
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        sshExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/ssh")
+    ) {
+        self.sshExecutableURL = sshExecutableURL
         controlDirectory = URL(fileURLWithPath: "/tmp/dropship-\(getuid())", isDirectory: true)
         try? fileManager.createDirectory(
             at: controlDirectory,
@@ -74,7 +115,7 @@ final class SSHProcessRunner: @unchecked Sendable {
 
     func runSSH(server: ServerConfig, command: String, input: Data? = nil, timeout: TimeInterval = 30) async throws -> ProcessResult {
         try await run(
-            executable: "/usr/bin/ssh",
+            executable: sshExecutableURL.path,
             arguments: sshArguments(for: server, command: command),
             input: input,
             timeout: timeout
@@ -144,57 +185,84 @@ final class SSHProcessRunner: @unchecked Sendable {
     }
 
     func streamUpload(server: ServerConfig, command: String, source: URL, offset: Int64, cancellation: TransferCancellation, progress: @escaping @Sendable (Int64) -> Void) async throws {
-        let started = try start(server, command, cancellation)
-        let sourceHandle = try FileHandle(forReadingFrom: source)
-        defer { try? sourceHandle.close() }
-        try sourceHandle.seek(toOffset: UInt64(offset))
-        var sent = offset
-        while !cancellation.isCancelled {
-            let data = try sourceHandle.read(upToCount: 262_144) ?? Data()
-            if data.isEmpty { break }
-            try started.input.fileHandleForWriting.write(contentsOf: data)
-            sent += Int64(data.count)
-            progress(sent)
-        }
-        try? started.input.fileHandleForWriting.close()
-        started.process.waitUntilExit()
-        let errors = started.error.fileHandleForReading.readDataToEndOfFile()
-        if cancellation.isCancelled { throw CoreProcessError.cancelled }
-        guard started.process.terminationStatus == 0 else {
-            throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
-        }
+        try await Task.detached {
+            let started = try self.start(server, command, cancellation)
+            let outputCollector = ProcessPipeCollector(
+                handle: started.output.fileHandleForReading,
+                byteLimit: 65_536
+            )
+            let errorCollector = ProcessPipeCollector(handle: started.error.fileHandleForReading)
+            do {
+                let sourceHandle = try FileHandle(forReadingFrom: source)
+                defer { try? sourceHandle.close() }
+                try sourceHandle.seek(toOffset: UInt64(offset))
+                var sent = offset
+                while !cancellation.isCancelled {
+                    let data = try sourceHandle.read(upToCount: 262_144) ?? Data()
+                    if data.isEmpty { break }
+                    try started.input.fileHandleForWriting.write(contentsOf: data)
+                    sent += Int64(data.count)
+                    progress(sent)
+                }
+                try? started.input.fileHandleForWriting.close()
+                started.process.waitUntilExit()
+                _ = outputCollector.waitForData()
+                let errors = errorCollector.waitForData()
+                if cancellation.isCancelled { throw CoreProcessError.cancelled }
+                guard started.process.terminationStatus == 0 else {
+                    throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
+                }
+            } catch {
+                try? started.input.fileHandleForWriting.close()
+                if started.process.isRunning { started.process.terminate() }
+                started.process.waitUntilExit()
+                _ = outputCollector.waitForData()
+                _ = errorCollector.waitForData()
+                throw error
+            }
+        }.value
     }
 
     func streamDownload(server: ServerConfig, command: String, destination: URL, offset: Int64, cancellation: TransferCancellation, progress: @escaping @Sendable (Int64) -> Void) async throws {
-        let started = try start(server, command, cancellation)
-        try? started.input.fileHandleForWriting.close()
-        if !FileManager.default.fileExists(atPath: destination.path) {
-            FileManager.default.createFile(atPath: destination.path, contents: nil)
-        }
-        let destinationHandle = try FileHandle(forWritingTo: destination)
-        defer { try? destinationHandle.close() }
-        if offset == 0 { try destinationHandle.truncate(atOffset: 0) }
-        try destinationHandle.seek(toOffset: UInt64(offset))
-        var received = offset
-        while !cancellation.isCancelled {
-            let data = try started.output.fileHandleForReading.read(upToCount: 262_144) ?? Data()
-            if data.isEmpty { break }
-            try destinationHandle.write(contentsOf: data)
-            received += Int64(data.count)
-            progress(received)
-        }
-        started.process.waitUntilExit()
-        let errors = started.error.fileHandleForReading.readDataToEndOfFile()
-        if cancellation.isCancelled { throw CoreProcessError.cancelled }
-        guard started.process.terminationStatus == 0 else {
-            throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
-        }
+        try await Task.detached {
+            let started = try self.start(server, command, cancellation)
+            let errorCollector = ProcessPipeCollector(handle: started.error.fileHandleForReading)
+            try? started.input.fileHandleForWriting.close()
+            do {
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    FileManager.default.createFile(atPath: destination.path, contents: nil)
+                }
+                let destinationHandle = try FileHandle(forWritingTo: destination)
+                defer { try? destinationHandle.close() }
+                if offset == 0 { try destinationHandle.truncate(atOffset: 0) }
+                try destinationHandle.seek(toOffset: UInt64(offset))
+                var received = offset
+                while !cancellation.isCancelled {
+                    let data = try started.output.fileHandleForReading.read(upToCount: 262_144) ?? Data()
+                    if data.isEmpty { break }
+                    try destinationHandle.write(contentsOf: data)
+                    received += Int64(data.count)
+                    progress(received)
+                }
+                started.process.waitUntilExit()
+                let errors = errorCollector.waitForData()
+                if cancellation.isCancelled { throw CoreProcessError.cancelled }
+                guard started.process.terminationStatus == 0 else {
+                    throw CoreProcessError.failed(started.process.terminationStatus, String(decoding: errors, as: UTF8.self))
+                }
+            } catch {
+                if started.process.isRunning { started.process.terminate() }
+                started.process.waitUntilExit()
+                _ = errorCollector.waitForData()
+                throw error
+            }
+        }.value
     }
 
     private struct Started { let process: Process; let input: Pipe; let output: Pipe; let error: Pipe }
     private func start(_ server: ServerConfig, _ command: String, _ cancellation: TransferCancellation) throws -> Started {
         let process = Process(), input = Pipe(), output = Pipe(), error = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.executableURL = sshExecutableURL
         process.arguments = sshArguments(for: server, command: command)
         process.standardInput = input
         process.standardOutput = output

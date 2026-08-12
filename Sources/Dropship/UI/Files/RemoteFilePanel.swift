@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import OSLog
+import UniformTypeIdentifiers
 
 // ============================================================
 // 远程文件面板：浏览服务器目录、上传/下载、增删改。
@@ -73,11 +75,18 @@ final class RemoteFileViewModel: ObservableObject {
 }
 
 struct RemoteFilePanel: View {
+    private static let dragLogger = Logger(subsystem: "com.dropship.app", category: "drag-drop")
     @EnvironmentObject private var env: AppEnvironment
+    @ObservedObject private var queue: TransferQueue
     @StateObject private var vm = RemoteFileViewModel()
     @State private var showNewFolder = false
     @State private var newFolderName = ""
+    @State private var folderError: String?
     @State private var confirmDelete: [RemoteEntry]?
+
+    init(queue: TransferQueue) {
+        self.queue = queue
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -105,12 +114,24 @@ struct RemoteFilePanel: View {
         .onChange(of: vm.path) { _, _ in
             reload()
         }
+        // 传输结束后自动刷新，否则刚传上去的文件不会出现在列表里
+        .onChange(of: finishedTransferSignature) { _, _ in
+            reload()
+        }
         .alert("新建文件夹", isPresented: $showNewFolder) {
             TextField("名称", text: $newFolderName)
             Button("取消", role: .cancel) { newFolderName = "" }
             Button("创建") { createFolder() }
         } message: {
             Text("请输入新文件夹名称")
+        }
+        .alert("创建文件夹失败", isPresented: Binding(
+            get: { folderError != nil },
+            set: { if !$0 { folderError = nil } }
+        )) {
+            Button("好", role: .cancel) { folderError = nil }
+        } message: {
+            Text(folderError ?? "未知错误")
         }
         .alert("确认删除", isPresented: Binding(
             get: { confirmDelete != nil },
@@ -129,6 +150,11 @@ struct RemoteFilePanel: View {
             }
         }
         .onAppear { resetToInitialPath() }
+        .onDrop(of: [UTType.item.identifier], isTargeted: nil) { providers in
+            FileTableView.receiveFileURLs(from: providers) { urls in
+                handleUpload(urls)
+            }
+        }
     }
 
     @ViewBuilder
@@ -156,6 +182,7 @@ struct RemoteFilePanel: View {
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
                     },
+                    dragProviderForRow: nil,
                     onDrop: { urls in handleUpload(urls) },
                     onDropInto: { urls, row in handleUpload(urls, into: row.path) }
                 )
@@ -232,6 +259,14 @@ struct RemoteFilePanel: View {
     @ViewBuilder
     private func contextMenu(for rows: [FileRow]) -> some View {
         let selected = vm.entries.filter { e in rows.contains { $0.id == e.path } }
+        if let directory = selected.first, selected.count == 1, directory.isDir {
+            Button {
+                vm.openEntry(directory)
+            } label: {
+                Label("打开文件夹", systemImage: "folder")
+            }
+            Divider()
+        }
         Button {
             downloadSelected(selected)
         } label: {
@@ -285,7 +320,14 @@ struct RemoteFilePanel: View {
     }
 
     /// remoteDir 为 nil 时落到当前目录；拖到某个目录行上时传入该行路径。
+    /// 已结束传输的指纹。任一任务进入完成/跳过状态，指纹变化，触发列表刷新。
+    private var finishedTransferSignature: Int {
+        queue.finishedTransferRevision
+    }
+
     private func handleUpload(_ urls: [URL], into remoteDir: String? = nil) {
+        let targetKind = remoteDir == nil ? "current" : "directory"
+        Self.dragLogger.info("upload callback: urls=\(urls.count, privacy: .public), target=\(targetKind, privacy: .public)")
         guard let server = env.selectedServer else { return }
         env.transferQueue.enqueueUpload(
             localURLs: urls,
@@ -325,21 +367,30 @@ struct RemoteFilePanel: View {
     }
 
     private func createFolder() {
-        guard let server = env.selectedServer,
-              !newFolderName.isEmpty else { return }
-        let target = (vm.path as NSString).appendingPathComponent(newFolderName)
-        Task {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            folderError = "文件夹名称不能为空"
+            return
+        }
+        guard name != ".", name != "..", !name.contains("/"),
+              !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            folderError = "请输入当前目录下的单个文件夹名称"
+            return
+        }
+        guard let server = env.selectedServer, !vm.path.isEmpty else {
+            folderError = "请先连接服务器并打开一个目录"
+            return
+        }
+
+        let target = (vm.path as NSString).appendingPathComponent(name)
+        Task { @MainActor in
             do {
                 try await env.remoteFiles.makeDirectory(server, path: target)
-                await MainActor.run {
-                    reload()
-                }
+                newFolderName = ""
+                reload()
             } catch {
-                await MainActor.run {
-                    vm.status = .failed(error.localizedDescription)
-                }
+                folderError = error.localizedDescription
             }
         }
-        newFolderName = ""
     }
 }

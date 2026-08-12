@@ -56,6 +56,65 @@ ssh <host> '~/.local/share/dropship/agent --version'
 
 ## 质量记录
 
+### 大文件拖入远程区域卡死/退出修复（2026-08-12）
+
+现象是普通大文件拖入服务器区域后先卡住再退出，但 `.zip` 等压缩包可正常上传。
+代码路径确认存在两个叠加问题：
+
+1. 队列对普通扩展名传入 `compress=true`，`AgentTransport` 因此追加 `--compress gzip`，
+   但 `SSHProcessRunner` 实际仍发送原始字节。远端 agent 会立刻以 gzip 格式错误退出；
+   `.zip` 在免压缩列表中，因此不触发这条错误路径。
+2. 流式传输只在子进程结束后读取 `stderr`，而 agent 会持续向 `stderr` 输出进度。
+   大文件传输可填满管道缓冲，导致 ssh 与客户端互相等待。
+
+修复：在客户端实现对称的流式 gzip 编解码前关闭传输压缩协商；上传和下载期间持续排空
+子进程管道，只保留最多 1 MiB 的错误尾部；保留应用入口的 `SIGPIPE` 忽略作为断管防护。
+
+自动验证：`swift test` 3 项通过，覆盖大量 stderr、子进程提前退出、普通文件禁用伪 gzip；
+`swift build`、`./scripts/build-app.sh` 和 `go test ./...` 通过。Finder 拖拽实机复现按用户要求留给用户执行。
+
+### 超大目录队列 CPU 优化（2026-08-12）
+
+对 32,337 个文件的 `node_modules` 上传诊断确认，CPU 热点来自完整任务数组的频繁发布、
+SwiftUI 对数万行的重复遍历/构建，以及每次进度回调都进入主线程。第一阶段优化保留原有
+“每文件一次传输”的协议不变：目录扫描按 250 个任务分批发布，任务 ID 使用索引表和待处理
+队列，摘要计数增量维护；UI 最多渲染 200 个任务，并用完成版本号刷新文件面板；进度回调在
+进入主线程前合并到每 100ms 一次，队列变化不再通过 AppEnvironment 广播给整个界面。
+
+新增 10,000 文件压力回归和 1,000 次突发进度回归，验证可见任务上限、摘要/索引一致性、
+进度节流和最终完成状态。真实大目录拖拽和 CPU 复测仍按用户要求由用户执行。
+
+### 真实接入完成，端到端可用（2026-08-11）
+
+UI 已彻底摘除 Mock，接入真实 Core。在 106.54.40.65（root）实测：
+
+| 环节 | 结果 |
+|---|---|
+| ssh config 解析 | ✅ 5 台全部正确，中文路径与 `~` 均展开 |
+| agent 自动部署 | ✅ 干净环境下自动装到 `/root/.local/share/dropship/agent` 755 |
+| 生效通道 | ✅ `agent`（二进制缺失时自动降级 `sftp`，两条路径均实测） |
+| 真实 list | ✅ 远程面板显示 `/root` 真实内容 |
+| 3MB 上传下载往返 | ✅ **MD5 完全一致** |
+| 磁盘空间 / stat / remove | ✅ 全部真实生效 |
+
+#### 接线时补上的 Core 缺口
+
+`ServerStore` 与 `TransferQueue` 原本**不是 ObservableObject**，SwiftUI 无法观察其变化，
+直接替换会导致界面永不刷新。已补 `ObservableObject` + `@Published`，并新增：
+
+- `ServerStore.setState(_:for:)` — 供 AppEnvironment 写入连接状态
+- `TransferQueue.removeTask(_:)` — `tasks` 改为 `private(set)` 后 UI 需要的移除入口
+
+连接编排放在 `AppEnvironment`：ServerStore 只存状态，实际连接由 RemoteFileServiceImpl 完成。
+
+#### 两个排查耗时较久的问题
+
+1. **`ByteCountFormatter` 缺 `.useBytes`** — 411 字节的文件显示成 `0 KB`
+2. **窗口启动后不出现** — `sample` 抓主线程栈发现卡在 `NSPersistentUIRestorer`，
+   是反复 `pkill` 强杀导致 macOS 窗口状态恢复记录损坏。已在 Info.plist 设
+   `NSQuitAlwaysKeepsWindows = false` 从源头关闭该机制。
+   排查中一度误判为 SSH 阻塞主线程，实际 `run()` 已正确派发到后台队列。
+
 ### SwiftUI 界面完成并修复 3 个集成缺陷（2026-08-10）
 
 2767 行，`swift build` 零错误零警告。深浅色模式均已截图验证，界面按 macOS 原生规范渲染。

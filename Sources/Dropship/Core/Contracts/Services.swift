@@ -39,10 +39,10 @@ public protocol RemoteFileService: AnyObject {
 
 // MARK: - 传输队列
 
-/// 传输队列。UI 观察 tasks 渲染进度，通过方法控制任务。
+/// 传输队列。tasks 保留完整任务历史，实现可另外提供有界的 UI 快照。
 @MainActor
 public protocol TransferQueueService: AnyObject {
-    /// 当前全部任务，含已完成。UI 直接渲染此数组。
+    /// 当前全部任务，含已完成。
     var tasks: [TransferTask] { get }
 
     /// 同时进行的传输数上限。考虑到上行带宽有限，默认 2。

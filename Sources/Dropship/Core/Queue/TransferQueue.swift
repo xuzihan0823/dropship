@@ -1,8 +1,38 @@
 import Foundation
+import Combine
 
 @MainActor
 final class TransferQueue: TransferQueueService, ObservableObject {
-    @Published private(set) var tasks: [TransferTask] = []
+    /// The complete task history remains available through the service contract.
+    /// It is deliberately not @Published: progress updates are throttled below so
+    /// a 30k-file queue does not force SwiftUI to diff the full array per callback.
+    private(set) var tasks: [TransferTask] = []
+
+    /// UI-facing projection. The queue can retain an arbitrary number of tasks,
+    /// while the panel only renders a bounded number of useful rows.
+    private(set) var visibleTasks: [TransferTask] = []
+    private(set) var activeCount = 0
+    private(set) var completedCount = 0
+    private(set) var totalBytes: Int64 = 0
+    private(set) var transferredBytes: Int64 = 0
+    private(set) var finishedTransferRevision = 0
+    private(set) var finishedCount = 0
+    private(set) var taskCount = 0
+    /// A single published revision drives the UI snapshot. All other queue
+    /// aggregates are plain stored properties updated before this changes.
+    @Published private(set) var snapshotRevision = 0
+
+    private let visibleTaskLimit = 200
+    private var visibleTaskIDs: [UUID] = []
+    private var visibleTaskIDSet: Set<UUID> = []
+    private var taskIndexes: [UUID: Int] = [:]
+    private var pendingTaskIDs: [UUID] = []
+    private var pendingCursor = 0
+    private var pendingTaskIDSet: Set<UUID> = []
+    private var pendingProgressPublish = false
+    private var progressPublishTask: Task<Void, Never>?
+    private var lastSnapshotPublish = Date.distantPast
+    private nonisolated let progressCoalescer = TransferProgressCoalescer()
     var maxConcurrent: Int = 2 {
         didSet {
             if maxConcurrent < 1 { maxConcurrent = 1 }
@@ -22,6 +52,10 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         self.service = service
     }
 
+    deinit {
+        progressPublishTask?.cancel()
+    }
+
     func enqueueUpload(
         localURLs: [URL],
         to server: ServerConfig,
@@ -29,10 +63,53 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         policy: ConflictPolicy
     ) {
         servers[server.id] = server
-        for url in localURLs {
-            enqueueUploadURL(url, server: server, remoteDir: remoteDir, policy: policy)
+        let queue = self
+        Task.detached {
+            var batch: [TransferTask] = []
+            let batchSize = 250
+
+            func flush() async {
+                guard !batch.isEmpty else { return }
+                let pending = batch
+                batch.removeAll(keepingCapacity: true)
+                await MainActor.run {
+                    queue.appendTasks(pending, policies: Dictionary(uniqueKeysWithValues: pending.map { ($0.id, policy) }))
+                    queue.startPending()
+                }
+            }
+
+            func walk(_ url: URL, remoteDirectory: String) async {
+                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                if values?.isDirectory == true {
+                    let childRemoteDirectory = Self.joinRemote(remoteDirectory, url.lastPathComponent)
+                    let children = try? FileManager.default.contentsOfDirectory(
+                        at: url,
+                        includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+                        options: [.skipsPackageDescendants]
+                    )
+                    for child in children ?? [] {
+                        await walk(child, remoteDirectory: childRemoteDirectory)
+                    }
+                    return
+                }
+
+                let task = TransferTask(
+                    serverID: server.id,
+                    direction: .upload,
+                    localURL: url,
+                    remotePath: Self.joinRemote(remoteDirectory, url.lastPathComponent),
+                    filename: url.lastPathComponent,
+                    totalBytes: Int64(values?.fileSize ?? 0)
+                )
+                batch.append(task)
+                if batch.count >= batchSize { await flush() }
+            }
+
+            for url in localURLs {
+                await walk(url, remoteDirectory: remoteDir)
+            }
+            await flush()
         }
-        startPending()
     }
 
     func enqueueDownload(
@@ -51,100 +128,267 @@ final class TransferQueue: TransferQueueService, ObservableObject {
                     policy: policy
                 )
             }
+            publishSnapshot()
             startPending()
         }
     }
 
     func pause(_ taskID: UUID) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { return }
+        guard let index = taskIndexes[taskID] else { return }
         cancellations[taskID]?.cancel()
         jobs[taskID]?.cancel()
-        tasks[index].state = .paused
+        updateTask(at: index) { $0.state = .paused }
+        requestSnapshot(immediate: true)
     }
 
     func resume(_ taskID: UUID) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }),
+        guard let index = taskIndexes[taskID],
               tasks[index].state == .paused else { return }
-        tasks[index].state = .queued
+        updateTask(at: index) { $0.state = .queued }
+        requestSnapshot(immediate: true)
         startPending()
     }
 
     func cancel(_ taskID: UUID) {
         cancellations[taskID]?.cancel()
         jobs[taskID]?.cancel()
-        if let index = tasks.firstIndex(where: { $0.id == taskID }) {
-            tasks[index].state = .cancelled
-            tasks[index].finishedAt = Date()
+        if let index = taskIndexes[taskID] {
+            updateTask(at: index) {
+                $0.state = .cancelled
+                $0.finishedAt = Date()
+            }
+            requestSnapshot(immediate: true)
         }
     }
 
     func retry(_ taskID: UUID) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }),
+        guard let index = taskIndexes[taskID],
               case .failed = tasks[index].state else { return }
-        tasks[index].state = .queued
-        tasks[index].finishedAt = nil
+        updateTask(at: index) {
+            $0.state = .queued
+            $0.finishedAt = nil
+        }
+        requestSnapshot(immediate: true)
         startPending()
     }
 
     /// 从列表中移除单个已结束的任务（UI 上每行的「移除」）。
     /// 仍在进行的任务需先 cancel，避免移除后后台仍在传输。
     func removeTask(_ taskID: UUID) {
-        guard let task = tasks.first(where: { $0.id == taskID }) else { return }
+        guard let index = taskIndexes[taskID] else { return }
+        let task = tasks[index]
         switch task.state {
         case .transferring, .preparing, .verifying:
             cancel(taskID)
         default:
             break
         }
-        tasks.removeAll { $0.id == taskID }
+        removeTask(at: index)
     }
 
     func clearFinished() {
-        tasks.removeAll {
-            switch $0.state {
-            case .completed, .skipped, .cancelled:
-                return true
-            default:
-                return false
+        let removedIDs = Set(tasks.lazy.filter { self.isFinished($0.state) }.map(\.id))
+        guard !removedIDs.isEmpty else { return }
+
+        tasks.removeAll { removedIDs.contains($0.id) }
+        for taskID in removedIDs {
+            policies.removeValue(forKey: taskID)
+            pendingTaskIDSet.remove(taskID)
+            visibleTaskIDSet.remove(taskID)
+        }
+        visibleTaskIDs.removeAll { removedIDs.contains($0) }
+        rebuildIndexesAndSummary()
+        publishSnapshot()
+    }
+
+    private func appendTasks(
+        _ newTasks: [TransferTask],
+        policies newPolicies: [UUID: ConflictPolicy],
+        publish: Bool = true
+    ) {
+        guard !newTasks.isEmpty else { return }
+        for task in newTasks {
+            let index = tasks.count
+            tasks.append(task)
+            taskIndexes[task.id] = index
+            if let policy = newPolicies[task.id] { policies[task.id] = policy }
+            applyTaskDelta(from: nil, to: task)
+            if task.state == .queued { enqueuePending(task.id) }
+            refreshVisibleTask(task.id)
+        }
+        taskCount = tasks.count
+        if publish { requestSnapshot() }
+    }
+
+    private func appendTask(_ task: TransferTask, publish: Bool = true) {
+        appendTasks([task], policies: [:], publish: publish)
+    }
+
+    private func updateTask(at index: Int, _ mutate: (inout TransferTask) -> Void) {
+        guard tasks.indices.contains(index) else { return }
+        let oldTask = tasks[index]
+        var newTask = oldTask
+        mutate(&newTask)
+        tasks[index] = newTask
+        applyTaskDelta(from: oldTask, to: newTask)
+        if newTask.state == .queued { enqueuePending(newTask.id) }
+        refreshVisibleTask(newTask.id)
+    }
+
+    private func applyTaskDelta(from oldTask: TransferTask?, to newTask: TransferTask?) {
+        if let oldTask {
+            totalBytes -= oldTask.totalBytes
+            transferredBytes -= oldTask.transferredBytes
+            if isActive(oldTask.state) { activeCount -= 1 }
+            if isCompleted(oldTask.state) { completedCount -= 1 }
+            if isFinished(oldTask.state) { finishedCount -= 1 }
+        }
+        if let newTask {
+            totalBytes += newTask.totalBytes
+            transferredBytes += newTask.transferredBytes
+            if isActive(newTask.state) { activeCount += 1 }
+            if isCompleted(newTask.state) { completedCount += 1 }
+            if isFinished(newTask.state) { finishedCount += 1 }
+            if isCompleted(newTask.state), oldTask.map({ !isCompleted($0.state) }) ?? true {
+                finishedTransferRevision &+= 1
             }
         }
     }
 
-    private func enqueueUploadURL(
-        _ url: URL,
-        server: ServerConfig,
-        remoteDir: String,
-        policy: ConflictPolicy
-    ) {
-        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
-        if values?.isDirectory == true {
-            let childRemoteDirectory = joinRemote(remoteDir, url.lastPathComponent)
-            let children = try? FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
-                options: [.skipsPackageDescendants]
-            )
-            for child in children ?? [] {
-                enqueueUploadURL(
-                    child,
-                    server: server,
-                    remoteDir: childRemoteDirectory,
-                    policy: policy
-                )
-            }
+    private func refreshVisibleTask(_ taskID: UUID) {
+        guard let index = taskIndexes[taskID], tasks.indices.contains(index) else { return }
+        let task = tasks[index]
+        let shouldInclude = visibleTaskIDSet.contains(taskID)
+            || visibleTaskIDs.count < visibleTaskLimit
+            || isActive(task.state)
+            || isFailed(task.state)
+            || isCompleted(task.state)
+        if shouldInclude && visibleTaskIDSet.insert(taskID).inserted {
+            visibleTaskIDs.append(taskID)
+        }
+        guard visibleTaskIDs.count > visibleTaskLimit else { return }
+        while visibleTaskIDs.count > visibleTaskLimit {
+            guard let removable = visibleTaskIDs.firstIndex(where: { id in
+                guard let removableIndex = taskIndexes[id], tasks.indices.contains(removableIndex) else { return true }
+                return !isActive(tasks[removableIndex].state)
+            }) else { break }
+            visibleTaskIDSet.remove(visibleTaskIDs.remove(at: removable))
+        }
+    }
+
+    private func publishSnapshot() {
+        visibleTasks = visibleTaskIDs.compactMap {
+            guard let index = taskIndexes[$0], tasks.indices.contains(index) else { return nil }
+            return tasks[index]
+        }
+        taskCount = tasks.count
+        snapshotRevision &+= 1
+        lastSnapshotPublish = Date()
+    }
+
+    private func requestSnapshot(immediate: Bool = false) {
+        if immediate {
+            pendingProgressPublish = false
+            progressPublishTask?.cancel()
+            progressPublishTask = nil
+            publishSnapshot()
             return
         }
+        guard !pendingProgressPublish else { return }
+        let delay = max(0, 0.1 - Date().timeIntervalSince(lastSnapshotPublish))
+        pendingProgressPublish = true
+        if delay == 0 {
+            pendingProgressPublish = false
+            publishSnapshot()
+            return
+        }
+        progressPublishTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            self.pendingProgressPublish = false
+            self.publishSnapshot()
+        }
+    }
 
-        let task = TransferTask(
-            serverID: server.id,
-            direction: .upload,
-            localURL: url,
-            remotePath: joinRemote(remoteDir, url.lastPathComponent),
-            filename: url.lastPathComponent,
-            totalBytes: Int64(values?.fileSize ?? 0)
-        )
-        tasks.append(task)
-        policies[task.id] = policy
+    private func removeTask(at index: Int) {
+        guard tasks.indices.contains(index) else { return }
+        let removed = tasks.remove(at: index)
+        applyTaskDelta(from: removed, to: nil)
+        taskIndexes.removeValue(forKey: removed.id)
+        policies.removeValue(forKey: removed.id)
+        pendingTaskIDSet.remove(removed.id)
+        visibleTaskIDSet.remove(removed.id)
+        visibleTaskIDs.removeAll { $0 == removed.id }
+        for shiftedIndex in index..<tasks.count {
+            taskIndexes[tasks[shiftedIndex].id] = shiftedIndex
+        }
+        requestSnapshot(immediate: true)
+    }
+
+    private func rebuildIndexesAndSummary() {
+        taskIndexes.removeAll(keepingCapacity: true)
+        activeCount = 0
+        completedCount = 0
+        finishedCount = 0
+        totalBytes = 0
+        transferredBytes = 0
+        for (index, task) in tasks.enumerated() {
+            taskIndexes[task.id] = index
+            totalBytes += task.totalBytes
+            transferredBytes += task.transferredBytes
+            if isActive(task.state) { activeCount += 1 }
+            if isCompleted(task.state) { completedCount += 1 }
+            if isFinished(task.state) { finishedCount += 1 }
+        }
+        taskCount = tasks.count
+    }
+
+    private func isActive(_ state: TransferState) -> Bool {
+        switch state {
+        case .transferring, .preparing, .verifying: return true
+        default: return false
+        }
+    }
+
+    private func isCompleted(_ state: TransferState) -> Bool {
+        switch state {
+        case .completed, .skipped: return true
+        default: return false
+        }
+    }
+
+    private func isFinished(_ state: TransferState) -> Bool {
+        switch state {
+        case .completed, .skipped, .cancelled: return true
+        default: return false
+        }
+    }
+
+    private func isFailed(_ state: TransferState) -> Bool {
+        if case .failed = state { return true }
+        return false
+    }
+
+    private func enqueuePending(_ taskID: UUID) {
+        guard pendingTaskIDSet.insert(taskID).inserted else { return }
+        pendingTaskIDs.append(taskID)
+    }
+
+    private func nextPendingTaskID() -> UUID? {
+        while pendingCursor < pendingTaskIDs.count {
+            let taskID = pendingTaskIDs[pendingCursor]
+            pendingCursor += 1
+            guard pendingTaskIDSet.remove(taskID) != nil else { continue }
+            if pendingCursor > 1024, pendingCursor * 2 > pendingTaskIDs.count {
+                pendingTaskIDs.removeFirst(pendingCursor)
+                pendingCursor = 0
+            }
+            return taskID
+        }
+        pendingTaskIDs.removeAll(keepingCapacity: true)
+        pendingCursor = 0
+        return nil
     }
 
     private func expandDownload(
@@ -177,7 +421,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
                     filename: entry.name,
                     state: .failed(transferError(from: error))
                 )
-                tasks.append(marker)
+                appendTask(marker, publish: false)
             }
             return
         }
@@ -190,26 +434,29 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             filename: entry.name,
             totalBytes: entry.size
         )
-        tasks.append(task)
+        appendTask(task, publish: false)
         policies[task.id] = policy
     }
 
     private func startPending() {
         removeFinishedJobs()
-        while jobs.count < maxConcurrent,
-              let index = tasks.firstIndex(where: { $0.state == .queued }) {
+        while jobs.count < maxConcurrent {
+            guard let transferID = nextPendingTaskID() else { break }
+            guard let index = taskIndexes[transferID], tasks[index].state == .queued else { continue }
             let transfer = tasks[index]
             guard let server = servers[transfer.serverID] else {
-                tasks[index].state = .failed(TransferError(
+                updateTask(at: index) { $0.state = .failed(TransferError(
                     code: "EINTERNAL",
                     message: "Server configuration is unavailable"
-                ))
+                )) }
                 continue
             }
             let cancellation = TransferCancellation()
             cancellations[transfer.id] = cancellation
-            tasks[index].state = .preparing
-            tasks[index].startedAt = tasks[index].startedAt ?? Date()
+            updateTask(at: index) {
+                $0.state = .preparing
+                $0.startedAt = $0.startedAt ?? Date()
+            }
             jobs[transfer.id] = Task { [weak self] in
                 await self?.run(
                     transferID: transfer.id,
@@ -218,6 +465,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
                 )
             }
         }
+        requestSnapshot()
     }
 
     private func run(
@@ -225,7 +473,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         server: ServerConfig,
         cancellation: TransferCancellation
     ) async {
-        guard var transfer = tasks.first(where: { $0.id == transferID }) else { return }
+        guard let transferIndex = taskIndexes[transferID] else { return }
+        var transfer = tasks[transferIndex]
         do {
             let policy = policies[transferID] ?? .ask
             transfer = try await resolveConflict(transfer, server: server, policy: policy)
@@ -247,10 +496,18 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             }
 
             setState(transferID, .transferring)
-            let compress = shouldCompress(transfer.filename)
+            // `--compress gzip` describes the bytes carried over SSH. The runner
+            // currently streams raw file bytes, so advertising gzip makes the
+            // agent reject ordinary files while pre-compressed files appear fine.
+            // Keep transport compression off until both upload and download have
+            // matching streaming gzip encode/decode support.
+            let compress = false
             let offset = transfer.transferredBytes
             let progress: @Sendable (Int64) -> Void = { [weak self] bytes in
-                Task { @MainActor in self?.updateProgress(transferID, bytes: bytes) }
+                guard let self else { return }
+                self.progressCoalescer.submit(taskID: transferID, bytes: bytes) { [weak self] latestBytes in
+                    Task { @MainActor in self?.updateProgress(transferID, bytes: latestBytes) }
+                }
             }
 
             if transfer.direction == .upload {
@@ -276,7 +533,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             }
             finish(transferID, state: .completed)
         } catch {
-            if let current = tasks.first(where: { $0.id == transferID }),
+            if let currentIndex = taskIndexes[transferID],
+               let current = tasks[safe: currentIndex],
                current.state == .paused || current.state == .cancelled {
                 completeJob(transferID)
                 return
@@ -284,12 +542,16 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             let mappedError = transferError(from: error)
             if mappedError.code == "ESIZE", automaticRetries[transferID, default: 0] < 3 {
                 automaticRetries[transferID, default: 0] += 1
-                if let index = tasks.firstIndex(where: { $0.id == transferID }) {
-                    tasks[index].transferredBytes = await resumableRemoteOffset(
+                if let index = taskIndexes[transferID] {
+                    let offset = await resumableRemoteOffset(
                         for: tasks[index],
                         server: server
                     )
-                    tasks[index].state = .queued
+                    updateTask(at: index) {
+                        $0.transferredBytes = offset
+                        $0.state = .queued
+                    }
+                    enqueuePending(transferID)
                 }
                 completeJob(transferID)
                 return
@@ -356,7 +618,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             let filename = extensionName.isEmpty
                 ? "\(base)-\(suffix)"
                 : "\(base)-\(suffix).\(extensionName)"
-            let candidate = joinRemote(directory, filename)
+            let candidate = Self.joinRemote(directory, filename)
             if (try? await service.stat(server, path: candidate)) == nil {
                 result = TransferTask(
                     id: task.id,
@@ -406,17 +668,6 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         )
     }
 
-    private func shouldCompress(_ filename: String) -> Bool {
-        let compressedExtensions: Set<String> = [
-            "zip", "gz", "bz2", "xz", "7z", "rar", "zst",
-            "jpg", "jpeg", "png", "gif", "webp", "avif", "heic",
-            "mp4", "mov", "mkv", "avi", "mp3", "aac", "flac", "pdf"
-        ]
-        return !compressedExtensions.contains(
-            NSString(string: filename).pathExtension.lowercased()
-        )
-    }
-
     private func localSHA256(_ url: URL) throws -> String? {
         let process = Process()
         let pipe = Pipe()
@@ -434,43 +685,63 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     }
 
     private func updateProgress(_ taskID: UUID, bytes: Int64) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { return }
-        tasks[index].transferredBytes = bytes
+        guard let index = taskIndexes[taskID] else { return }
+        switch tasks[index].state {
+        case .completed, .skipped, .cancelled: return
+        default: break
+        }
+        let previousBytes = tasks[index].transferredBytes
+        let clampedBytes = min(max(0, bytes), tasks[index].totalBytes > 0 ? tasks[index].totalBytes : bytes)
+        tasks[index].transferredBytes = clampedBytes
+        transferredBytes += clampedBytes - previousBytes
         let now = Date()
         var samples = speedSamples[taskID] ?? []
-        samples.append((now, bytes))
+        samples.append((now, clampedBytes))
         samples.removeAll { now.timeIntervalSince($0.0) > 5 }
         speedSamples[taskID] = samples
         if let first = samples.first {
             let duration = now.timeIntervalSince(first.0)
             if duration > 0.2 {
-                tasks[index].speed = Double(bytes - first.1) / duration
+                tasks[index].speed = Double(clampedBytes - first.1) / duration
             }
         }
+        refreshVisibleTask(taskID)
+        requestSnapshot()
     }
 
     private func replaceTask(_ task: TransferTask) {
-        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
-        tasks[index] = task
+        guard let index = taskIndexes[task.id] else { return }
+        updateTask(at: index) { $0 = task }
+        requestSnapshot()
     }
 
     private func setState(_ taskID: UUID, _ state: TransferState) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { return }
-        tasks[index].state = state
+        guard let index = taskIndexes[taskID] else { return }
+        updateTask(at: index) { $0.state = state }
+        requestSnapshot()
     }
 
     private func finish(_ taskID: UUID, state: TransferState) {
-        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { return }
-        tasks[index].state = state
-        tasks[index].finishedAt = Date()
-        tasks[index].speed = 0
+        guard let index = taskIndexes[taskID] else { return }
+        progressCoalescer.remove(taskID)
+        updateTask(at: index) {
+            $0.state = state
+            $0.finishedAt = Date()
+            $0.speed = 0
+            if state == .completed || state == .skipped {
+                $0.transferredBytes = $0.totalBytes
+            }
+        }
+        requestSnapshot()
     }
 
     private func completeJob(_ taskID: UUID) {
+        progressCoalescer.remove(taskID)
         jobs.removeValue(forKey: taskID)
         cancellations.removeValue(forKey: taskID)
         speedSamples.removeValue(forKey: taskID)
-        if let task = tasks.first(where: { $0.id == taskID }) {
+        if let index = taskIndexes[taskID] {
+            let task = tasks[index]
             switch task.state {
             case .completed, .skipped, .cancelled:
                 automaticRetries.removeValue(forKey: taskID)
@@ -483,7 +754,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
 
     private func removeFinishedJobs() {
         jobs = jobs.filter { taskID, _ in
-            guard let task = tasks.first(where: { $0.id == taskID }) else { return false }
+            guard let index = taskIndexes[taskID], let task = tasks[safe: index] else { return false }
             switch task.state {
             case .completed, .skipped, .failed, .cancelled, .paused:
                 return false
@@ -493,9 +764,54 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         }
     }
 
-    private func joinRemote(_ directory: String, _ name: String) -> String {
+    private nonisolated static func joinRemote(_ directory: String, _ name: String) -> String {
         if directory == "/" { return "/\(name)" }
         return directory.hasSuffix("/") ? directory + name : directory + "/" + name
+    }
+}
+
+private final class TransferProgressCoalescer: @unchecked Sendable {
+    private struct Pending {
+        var bytes: Int64
+        let deliver: @Sendable (Int64) -> Void
+    }
+
+    private let lock = NSLock()
+    private var pending: [UUID: Pending] = [:]
+    private var scheduled: Set<UUID> = []
+
+    func submit(
+        taskID: UUID,
+        bytes: Int64,
+        deliver: @escaping @Sendable (Int64) -> Void
+    ) {
+        lock.lock()
+        pending[taskID] = Pending(bytes: bytes, deliver: deliver)
+        let shouldSchedule = scheduled.insert(taskID).inserted
+        lock.unlock()
+        guard shouldSchedule else { return }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.scheduled.remove(taskID)
+            let latest = self.pending.removeValue(forKey: taskID)
+            self.lock.unlock()
+            latest?.deliver(latest?.bytes ?? 0)
+        }
+    }
+
+    func remove(_ taskID: UUID) {
+        lock.lock()
+        pending.removeValue(forKey: taskID)
+        scheduled.remove(taskID)
+        lock.unlock()
+    }
+}
+
+private extension Array {
+    subscript(safe index: Index) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 
