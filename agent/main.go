@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 func main() {
 	// SIGPIPE: when stdout pipe breaks (e.g. client closes), exit quietly

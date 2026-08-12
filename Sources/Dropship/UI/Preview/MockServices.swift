@@ -640,6 +640,21 @@ extension MockTransferQueue: TransferQueueService {
         }
     }
 
+    func cancelAll() {
+        let now = Date()
+        for idx in tasks.indices {
+            switch tasks[idx].state {
+            case .queued, .preparing, .transferring, .verifying, .paused:
+                tasks[idx].state = .cancelled
+                tasks[idx].speed = 0
+                tasks[idx].finishedAt = now
+            case .completed, .skipped, .failed, .cancelled:
+                break
+            }
+        }
+        objectWillChange.send()
+    }
+
     func retry(_ taskID: UUID) {
         if let idx = tasks.firstIndex(where: { $0.id == taskID }) {
             tasks[idx].state = .queued

@@ -78,6 +78,15 @@ struct TransferQueuePanel: View {
                     overallProgress
                 }
 
+                Button(role: .destructive) {
+                    queue.cancelAll()
+                } label: {
+                    Label("停止全部", systemImage: "stop.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!queue.hasCancellableTasks)
+
                 Button {
                     queue.clearFinished()
                 } label: {

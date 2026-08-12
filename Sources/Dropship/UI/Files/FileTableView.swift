@@ -62,7 +62,7 @@ struct FileTableView: View {
 
     let onOpen: (FileRow) -> Void
     let onContextMenu: ([FileRow]) -> AnyView
-    /// 本地文件表提供可拖出的 file URL；远程表不提供本地路径载荷。
+    /// 本地表提供 file URL，远程表提供仅应用内部识别的 URL 载荷。
     let dragProviderForRow: ((FileRow) -> NSItemProvider)?
     /// 投放到面板空白处＝落到当前目录。
     let onDrop: (([URL]) -> Void)?
@@ -70,8 +70,6 @@ struct FileTableView: View {
     let onDropInto: (([URL], FileRow) -> Void)?
 
     @State private var isDropTargeted = false
-    @State private var dropTargetRowID: String?
-
     var body: some View {
         // Table 由 NSTableView 支撑，拖拽会话被 AppKit 接管，
         // 单元格视图上的 .onDrop 收不到事件；必须用 TableRow 级别的
@@ -135,22 +133,36 @@ struct FileTableView: View {
 
                 // 完全异步，立即返回
                 DispatchQueue.global(qos: .userInitiated).async {
-                    FileTableView.receiveFileURLs(from: providers, handler: onDrop)
+                    _ = FileTableView.receiveFileURLs(from: providers, handler: onDrop)
                 }
                 return true
             }
     }
 
-    /// 单行：本地表提供拖出载荷，远程表不挂 itemProvider 以免阻断选中。
+    /// 目录行使用 TableRow 原生 dropDestination，让 NSTableView 负责准确
+    /// 命中和高亮；本地表同时提供拖出载荷。
     @TableRowBuilder<FileRow>
     private func tableRow(_ row: FileRow) -> some TableRowContent<FileRow> {
         if let dragProviderForRow {
-            TableRow(row)
-                .itemProvider {
-                    dragProviderForRow(row)
-                }
+            if row.isDir, let onDropInto {
+                TableRow(row)
+                    .itemProvider { dragProviderForRow(row) }
+                    .dropDestination(for: URL.self) { urls in
+                        onDropInto(urls, row)
+                    }
+            } else {
+                TableRow(row)
+                    .itemProvider { dragProviderForRow(row) }
+            }
         } else {
-            TableRow(row)
+            if row.isDir, let onDropInto {
+                TableRow(row)
+                    .dropDestination(for: URL.self) { urls in
+                        onDropInto(urls, row)
+                    }
+            } else {
+                TableRow(row)
+            }
         }
     }
 
@@ -252,92 +264,6 @@ struct FileTableView: View {
             return entries.filter { selection.contains($0.id) }
         }
         return [row]
-    }
-}
-
-// MARK: - 拖放代理
-
-/// 通过坐标查询目标行，提供行级高亮反馈。
-private struct FileDropDelegate: DropDelegate {
-    let entries: [FileRow]
-    let onDrop: (([URL]) -> Void)?
-    let onDropInto: (([URL], FileRow) -> Void)?
-    @Binding var isDropTargeted: Bool
-    @Binding var dropTargetRowID: String?
-
-    // 行高：macOS Table 默认行高约 20-22pt，加上间距取 24
-    private let estimatedRowHeight: CGFloat = 24
-
-    func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [UTType.fileURL, UTType.url])
-    }
-
-    func dropEntered(info: DropInfo) {
-        withAnimation(.easeInOut(duration: 0.12)) {
-            isDropTargeted = true
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        // 根据 y 坐标估算行索引（粗略：表头约 23pt + 行高 * index）
-        let headerHeight: CGFloat = 23
-        let y = info.location.y - headerHeight
-        guard y > 0 else {
-            dropTargetRowID = nil
-            return DropProposal(operation: .copy)
-        }
-
-        let rowIndex = Int(y / estimatedRowHeight)
-        if rowIndex >= 0, rowIndex < entries.count {
-            let row = entries[rowIndex]
-            if row.isDir, onDropInto != nil {
-                withAnimation(.easeInOut(duration: 0.1)) {
-                    dropTargetRowID = row.id
-                }
-                return DropProposal(operation: .copy)
-            }
-        }
-
-        withAnimation(.easeInOut(duration: 0.1)) {
-            dropTargetRowID = nil
-        }
-        return DropProposal(operation: .copy)
-    }
-
-    func dropExited(info: DropInfo) {
-        withAnimation(.easeInOut(duration: 0.12)) {
-            isDropTargeted = false
-            dropTargetRowID = nil
-        }
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        let providers = info.itemProviders(for: [UTType.fileURL.identifier, UTType.url.identifier])
-        guard !providers.isEmpty else { return false }
-
-        let targetID = dropTargetRowID
-        let targetRow = targetID.flatMap { id in entries.first(where: { $0.id == id }) }
-
-        // 立即返回，所有解析在后台进行
-        DispatchQueue.global(qos: .userInitiated).async {
-            FileTableView.receiveFileURLs(from: providers) { urls in
-                if let targetRow, targetRow.isDir, let onDropInto {
-                    onDropInto(urls, targetRow)
-                } else if let onDrop {
-                    onDrop(urls)
-                }
-            }
-        }
-
-        // 清理 UI 状态
-        DispatchQueue.main.async {
-            withAnimation(.easeInOut(duration: 0.12)) {
-                self.isDropTargeted = false
-                self.dropTargetRowID = nil
-            }
-        }
-
-        return true
     }
 }
 

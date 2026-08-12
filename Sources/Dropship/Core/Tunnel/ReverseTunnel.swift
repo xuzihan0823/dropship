@@ -228,32 +228,27 @@ private final class Established: @unchecked Sendable {
 final class TunnelStderrReader: @unchecked Sendable {
     private let group = DispatchGroup()
     private let lock = NSLock()
+    private let handle: FileHandle
     private let onLine: @Sendable (String) -> Void
+    private let byteLimit: Int
     private var tail = Data()
     private var pending = Data()
+    private var finished = false
 
     init(handle: FileHandle, byteLimit: Int = 65_536, onLine: @escaping @Sendable (String) -> Void) {
+        self.handle = handle
+        self.byteLimit = byteLimit
         self.onLine = onLine
         group.enter()
-        DispatchQueue.global(qos: .utility).async { [self] in
-            defer {
-                flushRemainder()
-                group.leave()
+        handle.readabilityHandler = { [weak self] readable in
+            guard let self else { return }
+            let chunk = readable.availableData
+            guard !chunk.isEmpty else {
+                readable.readabilityHandler = nil
+                self.finishReading()
+                return
             }
-            while true {
-                guard let chunk = try? handle.read(upToCount: 16_384), !chunk.isEmpty else { return }
-                lock.lock()
-                tail.append(chunk)
-                if tail.count > byteLimit { tail = Data(tail.suffix(byteLimit)) }
-                pending.append(chunk)
-                var lines: [String] = []
-                while let newline = pending.firstIndex(of: 0x0A) {
-                    lines.append(String(decoding: pending[pending.startIndex..<newline], as: UTF8.self))
-                    pending.removeSubrange(pending.startIndex...newline)
-                }
-                lock.unlock()
-                for line in lines { deliver(line) }
-            }
+            self.consume(chunk)
         }
     }
 
@@ -265,14 +260,32 @@ final class TunnelStderrReader: @unchecked Sendable {
         return String(decoding: tail, as: UTF8.self)
     }
 
-    /// 流结束时最后一行可能没有换行符，补交一次。
-    private func flushRemainder() {
+    private func consume(_ chunk: Data) {
         lock.lock()
+        tail.append(chunk)
+        if tail.count > byteLimit { tail = Data(tail.suffix(byteLimit)) }
+        pending.append(chunk)
+        var lines: [String] = []
+        while let newline = pending.firstIndex(of: 0x0A) {
+            lines.append(String(decoding: pending[pending.startIndex..<newline], as: UTF8.self))
+            pending.removeSubrange(pending.startIndex...newline)
+        }
+        lock.unlock()
+        for line in lines { deliver(line) }
+    }
+
+    /// 流结束时最后一行可能没有换行符，补交一次。
+    private func finishReading() {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        finished = true
         let remainder = pending
         pending = Data()
         lock.unlock()
-        guard !remainder.isEmpty else { return }
-        deliver(String(decoding: remainder, as: UTF8.self))
+        if !remainder.isEmpty {
+            deliver(String(decoding: remainder, as: UTF8.self))
+        }
+        group.leave()
     }
 
     private func deliver(_ line: String) {

@@ -17,7 +17,9 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private(set) var transferredBytes: Int64 = 0
     private(set) var finishedTransferRevision = 0
     private(set) var finishedCount = 0
+    private(set) var cancellableCount = 0
     private(set) var taskCount = 0
+    var hasCancellableTasks: Bool { cancellableCount > 0 || !activeEnqueueIDs.isEmpty }
     /// A single published revision drives the UI snapshot. All other queue
     /// aggregates are plain stored properties updated before this changes.
     @Published private(set) var snapshotRevision = 0
@@ -33,6 +35,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private var progressPublishTask: Task<Void, Never>?
     private var lastSnapshotPublish = Date.distantPast
     private nonisolated let progressCoalescer = TransferProgressCoalescer()
+    private var enqueueJobs: [UUID: Task<Void, Never>] = [:]
+    private var activeEnqueueIDs: Set<UUID> = []
     var maxConcurrent: Int = 2 {
         didSet {
             if maxConcurrent < 1 { maxConcurrent = 1 }
@@ -47,6 +51,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private var cancellations: [UUID: TransferCancellation] = [:]
     private var speedSamples: [UUID: [(Date, Int64)]] = [:]
     private var automaticRetries: [UUID: Int] = [:]
+    private var preparedRemoteDirectories: Set<RemoteDirectoryKey> = []
+    private var remoteDirectoryJobs: [RemoteDirectoryKey: Task<Void, Error>] = [:]
 
     init(service: FileTransport = RemoteFileServiceImpl()) {
         self.service = service
@@ -64,21 +70,29 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     ) {
         servers[server.id] = server
         let queue = self
-        Task.detached {
+        let enqueueID = UUID()
+        activeEnqueueIDs.insert(enqueueID)
+        requestSnapshot(immediate: true)
+        enqueueJobs[enqueueID] = Task.detached {
+            defer {
+                Task { @MainActor in queue.finishEnqueue(enqueueID) }
+            }
             var batch: [TransferTask] = []
             let batchSize = 250
 
             func flush() async {
-                guard !batch.isEmpty else { return }
+                guard !Task.isCancelled, !batch.isEmpty else { return }
                 let pending = batch
                 batch.removeAll(keepingCapacity: true)
                 await MainActor.run {
+                    guard queue.activeEnqueueIDs.contains(enqueueID) else { return }
                     queue.appendTasks(pending, policies: Dictionary(uniqueKeysWithValues: pending.map { ($0.id, policy) }))
                     queue.startPending()
                 }
             }
 
             func walk(_ url: URL, remoteDirectory: String) async {
+                guard !Task.isCancelled else { return }
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
                 if values?.isDirectory == true {
                     let childRemoteDirectory = Self.joinRemote(remoteDirectory, url.lastPathComponent)
@@ -88,6 +102,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
                         options: [.skipsPackageDescendants]
                     )
                     for child in children ?? [] {
+                        guard !Task.isCancelled else { return }
                         await walk(child, remoteDirectory: childRemoteDirectory)
                     }
                     return
@@ -106,6 +121,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             }
 
             for url in localURLs {
+                guard !Task.isCancelled else { return }
                 await walk(url, remoteDirectory: remoteDir)
             }
             await flush()
@@ -159,6 +175,41 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             }
             requestSnapshot(immediate: true)
         }
+    }
+
+    func cancelAll() {
+        activeEnqueueIDs.removeAll(keepingCapacity: true)
+        for job in enqueueJobs.values { job.cancel() }
+        enqueueJobs.removeAll()
+        for cancellation in cancellations.values { cancellation.cancel() }
+        for job in jobs.values { job.cancel() }
+
+        let now = Date()
+        for index in tasks.indices {
+            switch tasks[index].state {
+            case .queued, .preparing, .transferring, .verifying, .paused:
+                updateTask(at: index) {
+                    $0.state = .cancelled
+                    $0.finishedAt = now
+                    $0.speed = 0
+                }
+            case .completed, .skipped, .failed, .cancelled:
+                break
+            }
+        }
+        pendingTaskIDs.removeAll(keepingCapacity: true)
+        pendingTaskIDSet.removeAll(keepingCapacity: true)
+        pendingCursor = 0
+        preparedRemoteDirectories.removeAll(keepingCapacity: true)
+        for job in remoteDirectoryJobs.values { job.cancel() }
+        remoteDirectoryJobs.removeAll(keepingCapacity: true)
+        requestSnapshot(immediate: true)
+    }
+
+    private func finishEnqueue(_ enqueueID: UUID) {
+        activeEnqueueIDs.remove(enqueueID)
+        enqueueJobs.removeValue(forKey: enqueueID)
+        requestSnapshot(immediate: true)
     }
 
     func retry(_ taskID: UUID) {
@@ -242,6 +293,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             if isActive(oldTask.state) { activeCount -= 1 }
             if isCompleted(oldTask.state) { completedCount -= 1 }
             if isFinished(oldTask.state) { finishedCount -= 1 }
+            if isCancellable(oldTask.state) { cancellableCount -= 1 }
         }
         if let newTask {
             totalBytes += newTask.totalBytes
@@ -249,6 +301,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             if isActive(newTask.state) { activeCount += 1 }
             if isCompleted(newTask.state) { completedCount += 1 }
             if isFinished(newTask.state) { finishedCount += 1 }
+            if isCancellable(newTask.state) { cancellableCount += 1 }
             if isCompleted(newTask.state), oldTask.map({ !isCompleted($0.state) }) ?? true {
                 finishedTransferRevision &+= 1
             }
@@ -331,6 +384,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         activeCount = 0
         completedCount = 0
         finishedCount = 0
+        cancellableCount = 0
         totalBytes = 0
         transferredBytes = 0
         for (index, task) in tasks.enumerated() {
@@ -340,6 +394,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             if isActive(task.state) { activeCount += 1 }
             if isCompleted(task.state) { completedCount += 1 }
             if isFinished(task.state) { finishedCount += 1 }
+            if isCancellable(task.state) { cancellableCount += 1 }
         }
         taskCount = tasks.count
     }
@@ -368,6 +423,13 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private func isFailed(_ state: TransferState) -> Bool {
         if case .failed = state { return true }
         return false
+    }
+
+    private func isCancellable(_ state: TransferState) -> Bool {
+        switch state {
+        case .queued, .preparing, .transferring, .verifying, .paused: return true
+        case .completed, .skipped, .failed, .cancelled: return false
+        }
     }
 
     private func enqueuePending(_ taskID: UUID) {
@@ -476,6 +538,9 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         guard let transferIndex = taskIndexes[transferID] else { return }
         var transfer = tasks[transferIndex]
         do {
+            if transfer.direction == .upload {
+                try await ensureRemoteParentDirectory(for: transfer, server: server)
+            }
             let policy = policies[transferID] ?? .ask
             transfer = try await resolveConflict(transfer, server: server, policy: policy)
             replaceTask(transfer)
@@ -556,7 +621,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
                 completeJob(transferID)
                 return
             }
-            finish(transferID, state: .failed(mappedError))
+            let persistedBytes = await resumableOffset(for: transferID, server: server)
+            finish(transferID, state: .failed(mappedError), transferredBytes: persistedBytes)
         }
         completeJob(transferID)
     }
@@ -569,6 +635,46 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         let partPath = task.remotePath + ".dropship-part"
         guard let entry = try? await service.stat(server, path: partPath) else { return 0 }
         return min(entry.size, task.totalBytes)
+    }
+
+    private func resumableOffset(for taskID: UUID, server: ServerConfig) async -> Int64 {
+        guard let index = taskIndexes[taskID] else { return 0 }
+        let task = tasks[index]
+        if task.direction == .upload {
+            return await resumableRemoteOffset(for: task, server: server)
+        }
+        guard let size = try? task.localURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return 0
+        }
+        return min(Int64(size), task.totalBytes)
+    }
+
+    private func ensureRemoteParentDirectory(
+        for task: TransferTask,
+        server: ServerConfig
+    ) async throws {
+        let parent = NSString(string: task.remotePath).deletingLastPathComponent
+        guard !parent.isEmpty, parent != "/" else { return }
+        let key = RemoteDirectoryKey(serverID: server.id, path: parent)
+        if preparedRemoteDirectories.contains(key) { return }
+
+        let job: Task<Void, Error>
+        if let existing = remoteDirectoryJobs[key] {
+            job = existing
+        } else {
+            let service = self.service
+            job = Task { try await service.makeDirectory(server, path: parent) }
+            remoteDirectoryJobs[key] = job
+        }
+
+        do {
+            try await job.value
+            preparedRemoteDirectories.insert(key)
+            remoteDirectoryJobs.removeValue(forKey: key)
+        } catch {
+            remoteDirectoryJobs.removeValue(forKey: key)
+            throw error
+        }
     }
 
     private func resolveConflict(
@@ -687,7 +793,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private func updateProgress(_ taskID: UUID, bytes: Int64) {
         guard let index = taskIndexes[taskID] else { return }
         switch tasks[index].state {
-        case .completed, .skipped, .cancelled: return
+        case .completed, .skipped, .failed, .cancelled: return
         default: break
         }
         let previousBytes = tasks[index].transferredBytes
@@ -721,14 +827,20 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         requestSnapshot()
     }
 
-    private func finish(_ taskID: UUID, state: TransferState) {
+    private func finish(
+        _ taskID: UUID,
+        state: TransferState,
+        transferredBytes: Int64? = nil
+    ) {
         guard let index = taskIndexes[taskID] else { return }
         progressCoalescer.remove(taskID)
         updateTask(at: index) {
             $0.state = state
             $0.finishedAt = Date()
             $0.speed = 0
-            if state == .completed || state == .skipped {
+            if let transferredBytes {
+                $0.transferredBytes = transferredBytes
+            } else if state == .completed || state == .skipped {
                 $0.transferredBytes = $0.totalBytes
             }
         }
@@ -750,6 +862,10 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             }
         }
         startPending()
+        if jobs.isEmpty, pendingTaskIDSet.isEmpty {
+            preparedRemoteDirectories.removeAll(keepingCapacity: true)
+            remoteDirectoryJobs.removeAll(keepingCapacity: true)
+        }
     }
 
     private func removeFinishedJobs() {
@@ -768,6 +884,11 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         if directory == "/" { return "/\(name)" }
         return directory.hasSuffix("/") ? directory + name : directory + "/" + name
     }
+}
+
+private struct RemoteDirectoryKey: Hashable {
+    let serverID: UUID
+    let path: String
 }
 
 private final class TransferProgressCoalescer: @unchecked Sendable {

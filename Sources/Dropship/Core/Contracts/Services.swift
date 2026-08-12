@@ -67,6 +67,8 @@ public protocol TransferQueueService: AnyObject {
     func pause(_ taskID: UUID)
     func resume(_ taskID: UUID)
     func cancel(_ taskID: UUID)
+    /// 取消当前队列中所有未结束任务，并停止仍在进行的目录扫描。
+    func cancelAll()
     func retry(_ taskID: UUID)
 
     /// 清除已完成/已跳过/已取消的任务，保留失败项。

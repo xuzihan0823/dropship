@@ -119,11 +119,15 @@ final class InboxServer: @unchecked Sendable {
             listener.start(queue: queue)
         }
 
+        store(listener: listener, port: boundPort)
+        return boundPort
+    }
+
+    private func store(listener: NWListener, port: UInt16) {
         lock.lock()
         self.listener = listener
-        self.boundPort = boundPort
+        boundPort = port
         lock.unlock()
-        return boundPort
     }
 
     func stop() {

@@ -82,6 +82,7 @@ struct RemoteFilePanel: View {
     @State private var showNewFolder = false
     @State private var newFolderName = ""
     @State private var folderError: String?
+    @State private var moveError: String?
     @State private var confirmDelete: [RemoteEntry]?
 
     init(queue: TransferQueue) {
@@ -133,6 +134,14 @@ struct RemoteFilePanel: View {
         } message: {
             Text(folderError ?? "未知错误")
         }
+        .alert("移动失败", isPresented: Binding(
+            get: { moveError != nil },
+            set: { if !$0 { moveError = nil } }
+        )) {
+            Button("好", role: .cancel) { moveError = nil }
+        } message: {
+            Text(moveError ?? "未知错误")
+        }
         .alert("确认删除", isPresented: Binding(
             get: { confirmDelete != nil },
             set: { if !$0 { confirmDelete = nil } }
@@ -150,11 +159,6 @@ struct RemoteFilePanel: View {
             }
         }
         .onAppear { resetToInitialPath() }
-        .onDrop(of: [UTType.item.identifier], isTargeted: nil) { providers in
-            FileTableView.receiveFileURLs(from: providers) { urls in
-                handleUpload(urls)
-            }
-        }
     }
 
     @ViewBuilder
@@ -182,9 +186,17 @@ struct RemoteFilePanel: View {
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
                     },
-                    dragProviderForRow: nil,
-                    onDrop: { urls in handleUpload(urls) },
-                    onDropInto: { urls, row in handleUpload(urls, into: row.path) }
+                    dragProviderForRow: { row in
+                        guard let server = env.selectedServer else { return NSItemProvider() }
+                        return RemoteFileDragPayload(
+                            serverID: server.id,
+                            path: row.path,
+                            name: row.name,
+                            isDirectory: row.isDir
+                        ).itemProvider()
+                    },
+                    onDrop: { urls in handleDrop(urls, into: vm.path) },
+                    onDropInto: { urls, row in handleDrop(urls, into: row.path) }
                 )
                 if case .loading = vm.status {
                     ProgressView().controlSize(.regular)
@@ -335,6 +347,56 @@ struct RemoteFilePanel: View {
             remoteDir: remoteDir ?? vm.path,
             policy: .ask
         )
+    }
+
+    private func handleDrop(_ urls: [URL], into targetDirectory: String) {
+        let remotePayloads = urls.compactMap(RemoteFileDragPayload.init(dragURL:))
+        let localURLs = urls.filter(\.isFileURL)
+        Self.dragLogger.info(
+            "classified drop: local=\(localURLs.count, privacy: .public), remote=\(remotePayloads.count, privacy: .public)"
+        )
+        if !localURLs.isEmpty {
+            handleUpload(localURLs, into: targetDirectory)
+        }
+        if !remotePayloads.isEmpty {
+            handleRemoteMove(remotePayloads, into: targetDirectory)
+        }
+    }
+
+    private func handleRemoteMove(
+        _ payloads: [RemoteFileDragPayload],
+        into targetDirectory: String
+    ) {
+        guard let server = env.selectedServer, !payloads.isEmpty else { return }
+        Task { @MainActor in
+            do {
+                for payload in payloads {
+                    let plan = try RemoteFileMovePlan.make(
+                        payload: payload,
+                        targetDirectory: targetDirectory,
+                        selectedServerID: server.id
+                    )
+
+                    do {
+                        _ = try await env.remoteFiles.stat(server, path: plan.targetPath)
+                        throw RemoteFileMoveError.targetExists(payload.name)
+                    } catch let error as TransferError where error.code == "ENOENT" {
+                        // The destination is free. Other stat failures must be surfaced.
+                    }
+
+                    try await env.remoteFiles.move(
+                        server,
+                        from: plan.sourcePath,
+                        to: plan.targetPath
+                    )
+                    vm.selection.remove(plan.sourcePath)
+                }
+                reload()
+            } catch {
+                moveError = AppEnvironment.describe(error)
+                reload()
+            }
+        }
     }
 
     private func downloadSelected(_ entries: [RemoteEntry]) {

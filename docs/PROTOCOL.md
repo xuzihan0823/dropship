@@ -62,7 +62,7 @@ Mac 客户端 ──/usr/bin/ssh──> ~/.local/share/dropship/agent <模式参
 
 | op | args | data 返回 |
 |---|---|---|
-| `hello` | `{}` | `{"version":"1.0.0","protocol":1,"arch":"amd64","os":"linux","home":"/root"}` |
+| `hello` | `{}` | `{"version":"1.0.1","protocol":1,"arch":"amd64","os":"linux","home":"/root"}` |
 | `list` | `{"path":"/root","showHidden":false}` | `{"entries":[Entry...]}` |
 | `stat` | `{"path":"/root/a.txt"}` | `{"entry":Entry}` |
 | `mkdir` | `{"path":"/root/新目录","parents":true}` | `{}` |

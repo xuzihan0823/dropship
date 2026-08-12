@@ -1,7 +1,7 @@
 import Foundation
 
 struct Bootstrapper {
-    static let agentVersion = "1.0.0"
+    static let agentVersion = "1.0.1"
 
     private let runner: SSHProcessRunner
     private let resourcesURL: URL?

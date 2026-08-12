@@ -393,8 +393,7 @@ private final class RawHTTPClient: @unchecked Sendable {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return "" }
         let connection = NWConnection(host: .ipv4(.loopback), port: endpointPort, using: .tcp)
 
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        connection.stateUpdateHandler = { [self] state in
             switch state {
             case .ready:
                 var payload = Data(head.utf8)
@@ -424,8 +423,7 @@ private final class RawHTTPClient: @unchecked Sendable {
     }
 
     private func read(from connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [self] data, _, isComplete, error in
             if let data, !data.isEmpty {
                 self.lock.lock()
                 self.received.append(data)

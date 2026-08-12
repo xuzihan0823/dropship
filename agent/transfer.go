@@ -187,11 +187,12 @@ func hashRange(path string, offset, size int64) (string, int64, error) {
 // --- recv mode (--recv): Mac -> server, stdin -> file ---
 
 type recvFlags struct {
-	Path       string
-	Offset     int64
-	Compress   string
-	ExpectSize int64
-	ExpectHash string
+	Path          string
+	Offset        int64
+	Compress      string
+	ExpectSize    int64
+	ExpectSizeSet bool
+	ExpectHash    string
 }
 
 func parseRecvArgs(args []string) (*recvFlags, error) {
@@ -229,6 +230,7 @@ func parseRecvArgs(args []string) (*recvFlags, error) {
 				return nil, fmt.Errorf("invalid --expect-size: %v", err)
 			}
 			f.ExpectSize = n
+			f.ExpectSizeSet = true
 			i++
 		case "--expect-hash":
 			if i+1 >= len(args) {
@@ -243,7 +245,7 @@ func parseRecvArgs(args []string) (*recvFlags, error) {
 	if f.Path == "" {
 		return nil, fmt.Errorf("--path is required")
 	}
-	if f.ExpectSize == 0 {
+	if !f.ExpectSizeSet {
 		return nil, fmt.Errorf("--expect-size is required")
 	}
 	if f.Compress != "" && f.Compress != "gzip" {

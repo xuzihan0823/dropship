@@ -14,6 +14,9 @@ APP_DIR="$ROOT/build/$APP_NAME.app"
 echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG"
 
+echo "==> 构建 Linux agent"
+"$ROOT/agent/build.sh"
+
 BIN_PATH="$(swift build -c "$CONFIG" --show-bin-path)/$APP_NAME"
 if [[ ! -f "$BIN_PATH" ]]; then
     echo "错误：未找到可执行文件 $BIN_PATH" >&2
@@ -25,11 +28,9 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
 
-# 打包 Go agent 二进制（若已构建），供首次连接时上传到服务器
-if [[ -d "$ROOT/build/agents" ]]; then
-    cp -R "$ROOT/build/agents" "$APP_DIR/Contents/Resources/agents"
-    echo "    已嵌入 agent 二进制"
-fi
+# 打包 Go agent 二进制，供首次连接或版本升级时上传到服务器
+cp -R "$ROOT/build/agents" "$APP_DIR/Contents/Resources/agents"
+echo "    已嵌入 agent 二进制"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

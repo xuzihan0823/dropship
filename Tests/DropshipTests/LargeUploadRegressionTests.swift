@@ -51,6 +51,90 @@ final class SSHProcessRunnerRegressionTests: XCTestCase {
     }
 }
 
+final class RemoteFileMovePlanTests: XCTestCase {
+    private let serverID = UUID()
+
+    func testBuildsTargetInsideChosenDirectory() throws {
+        let payload = makePayload(path: "/root/archive.zip", name: "archive.zip")
+        let plan = try RemoteFileMovePlan.make(
+            payload: payload,
+            targetDirectory: "/root/projects",
+            selectedServerID: serverID
+        )
+
+        XCTAssertEqual(plan.sourcePath, "/root/archive.zip")
+        XCTAssertEqual(plan.targetPath, "/root/projects/archive.zip")
+    }
+
+    func testInternalDragURLRoundTripsWithoutBecomingAFileURL() throws {
+        let payload = makePayload(
+            path: "/root/工程项目/大文件.zip",
+            name: "大文件.zip",
+            isDirectory: false
+        )
+
+        XCTAssertFalse(payload.dragURL.isFileURL)
+        XCTAssertEqual(RemoteFileDragPayload(dragURL: payload.dragURL), payload)
+        XCTAssertTrue(payload.itemProvider().registeredTypeIdentifiers.contains("public.url"))
+        XCTAssertFalse(payload.itemProvider().registeredTypeIdentifiers.contains("public.file-url"))
+    }
+
+    func testRejectsPayloadFromAnotherServer() {
+        let payload = RemoteFileDragPayload(
+            serverID: UUID(),
+            path: "/root/archive.zip",
+            name: "archive.zip",
+            isDirectory: false
+        )
+        XCTAssertThrowsError(try RemoteFileMovePlan.make(
+            payload: payload,
+            targetDirectory: "/root/projects",
+            selectedServerID: serverID
+        )) { error in
+            XCTAssertEqual(error as? RemoteFileMoveError, .differentServer)
+        }
+    }
+
+    func testRejectsMovingEntryToItsCurrentDirectory() {
+        let payload = makePayload(path: "/root/archive.zip", name: "archive.zip")
+        XCTAssertThrowsError(try RemoteFileMovePlan.make(
+            payload: payload,
+            targetDirectory: "/root",
+            selectedServerID: serverID
+        )) { error in
+            XCTAssertEqual(error as? RemoteFileMoveError, .alreadyInDirectory)
+        }
+    }
+
+    func testRejectsMovingDirectoryIntoItsOwnSubtree() {
+        let payload = makePayload(
+            path: "/root/projects",
+            name: "projects",
+            isDirectory: true
+        )
+        XCTAssertThrowsError(try RemoteFileMovePlan.make(
+            payload: payload,
+            targetDirectory: "/root/projects/nested",
+            selectedServerID: serverID
+        )) { error in
+            XCTAssertEqual(error as? RemoteFileMoveError, .directoryInsideItself)
+        }
+    }
+
+    private func makePayload(
+        path: String,
+        name: String,
+        isDirectory: Bool = false
+    ) -> RemoteFileDragPayload {
+        RemoteFileDragPayload(
+            serverID: serverID,
+            path: path,
+            name: name,
+            isDirectory: isDirectory
+        )
+    }
+}
+
 @MainActor
 final class TransferQueueCompressionRegressionTests: XCTestCase {
     func testOrdinaryFileUploadDoesNotAdvertiseGzipForRawBytes() async throws {
@@ -72,6 +156,57 @@ final class TransferQueueCompressionRegressionTests: XCTestCase {
 
         await fulfillment(of: [transport.uploaded], timeout: 3)
         XCTAssertEqual(transport.compressionValues, [false])
+    }
+
+    func testDirectoryUploadCreatesRemoteParentOnceBeforeConcurrentFiles() async throws {
+        let transport = DirectoryRecordingTransport()
+        let queue = TransferQueue(service: transport)
+        queue.maxConcurrent = 2
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data([0x41]).write(to: directory.appendingPathComponent("one.txt"))
+        try Data([0x42]).write(to: directory.appendingPathComponent("two.txt"))
+
+        queue.enqueueUpload(
+            localURLs: [directory],
+            to: DirectoryRecordingTransport.server,
+            remoteDir: "/root",
+            policy: .overwrite
+        )
+
+        await fulfillment(of: [transport.uploaded], timeout: 3)
+        XCTAssertEqual(transport.createdDirectories, ["/root/\(directory.lastPathComponent)"])
+        XCTAssertTrue(transport.uploadedAfterDirectoryCreation)
+    }
+
+    func testFailedUploadUsesPersistedPartSizeInsteadOfSentBytes() async throws {
+        let transport = FailingAfterProgressTransport()
+        let queue = TransferQueue(service: transport)
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data(repeating: 0x41, count: 1_024).write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        queue.enqueueUpload(
+            localURLs: [source],
+            to: FailingAfterProgressTransport.server,
+            remoteDir: "/missing",
+            policy: .overwrite
+        )
+
+        await fulfillment(of: [transport.failed], timeout: 3)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        guard let task = queue.tasks.first else {
+            return XCTFail("Expected failed transfer task")
+        }
+        guard case .failed = task.state else {
+            return XCTFail("Expected failed state")
+        }
+        XCTAssertEqual(task.transferredBytes, 0)
+        XCTAssertEqual(queue.transferredBytes, 0)
+        XCTAssertEqual(queue.visibleTasks.first?.transferredBytes, 0)
     }
 }
 
@@ -138,6 +273,51 @@ final class TransferQueueScalingRegressionTests: XCTestCase {
         XCTAssertEqual(queue.transferredBytes, 1_000)
         XCTAssertEqual(queue.visibleTasks.first?.transferredBytes, 1_000)
         XCTAssertEqual(queue.finishedTransferRevision, 1)
+    }
+
+    func testCancelAllStopsRunningAndQueuedTasks() async throws {
+        let transport = SuspendedTransport()
+        let queue = TransferQueue(service: transport)
+        queue.maxConcurrent = 1
+        let fixture = try ManyFilesFixture(count: 50, fileSize: 3)
+        defer { fixture.remove() }
+
+        queue.enqueueUpload(
+            localURLs: [fixture.directory],
+            to: SuspendedTransport.server,
+            remoteDir: "/tmp",
+            policy: .overwrite
+        )
+        try await waitUntil(timeout: 3) { queue.taskCount == 50 && queue.activeCount == 1 }
+
+        queue.cancelAll()
+        try await waitUntil(timeout: 3) { queue.activeCount == 0 }
+
+        XCTAssertFalse(queue.hasCancellableTasks)
+        XCTAssertTrue(queue.tasks.allSatisfy {
+            if case .cancelled = $0.state { return true }
+            return false
+        })
+    }
+
+    func testCancelAllStopsDirectoryScanningBeforeItPublishesEverything() async throws {
+        let transport = SuspendedTransport()
+        let queue = TransferQueue(service: transport)
+        let fixture = try ManyFilesFixture(count: 5_000, fileSize: 1)
+        defer { fixture.remove() }
+
+        queue.enqueueUpload(
+            localURLs: [fixture.directory],
+            to: SuspendedTransport.server,
+            remoteDir: "/tmp",
+            policy: .overwrite
+        )
+        XCTAssertTrue(queue.hasCancellableTasks)
+        queue.cancelAll()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertFalse(queue.hasCancellableTasks)
+        XCTAssertEqual(queue.taskCount, 0)
     }
 
     private func waitUntil(
@@ -224,6 +404,64 @@ private final class RecordingTransport: FileTransport, @unchecked Sendable {
         cancellation: TransferCancellation,
         progress: @escaping @Sendable (Int64) -> Void
     ) async throws {}
+}
+
+private final class DirectoryRecordingTransport: TransportStub, @unchecked Sendable {
+    let uploaded = XCTestExpectation(description: "both uploads called")
+    private let lock = NSLock()
+    private var directories: [String] = []
+    private var uploadsAfterCreation = true
+
+    override init() {
+        uploaded.expectedFulfillmentCount = 2
+    }
+
+    var createdDirectories: [String] {
+        lock.withLock { directories }
+    }
+
+    var uploadedAfterDirectoryCreation: Bool {
+        lock.withLock { uploadsAfterCreation }
+    }
+
+    override func makeDirectory(_ server: ServerConfig, path: String) async throws {
+        try await Task.sleep(nanoseconds: 100_000_000)
+        lock.withLock { directories.append(path) }
+    }
+
+    override func upload(
+        _ server: ServerConfig,
+        local: URL,
+        remote: String,
+        offset: Int64,
+        compress: Bool,
+        cancellation: TransferCancellation,
+        progress: @escaping @Sendable (Int64) -> Void
+    ) async throws {
+        lock.withLock {
+            if directories.isEmpty { uploadsAfterCreation = false }
+        }
+        uploaded.fulfill()
+    }
+}
+
+private final class FailingAfterProgressTransport: TransportStub, @unchecked Sendable {
+    let failed = XCTestExpectation(description: "upload failed after progress")
+
+    override func upload(
+        _ server: ServerConfig,
+        local: URL,
+        remote: String,
+        offset: Int64,
+        compress: Bool,
+        cancellation: TransferCancellation,
+        progress: @escaping @Sendable (Int64) -> Void
+    ) async throws {
+        let size = Int64(try local.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        progress(size)
+        failed.fulfill()
+        throw TransferError(code: "ENOENT", message: "remote parent missing")
+    }
 }
 
 private struct ManyFilesFixture {
