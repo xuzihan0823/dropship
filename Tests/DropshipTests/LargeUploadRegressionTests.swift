@@ -136,6 +136,73 @@ final class RemoteFileMovePlanTests: XCTestCase {
 }
 
 @MainActor
+final class RemoteInitialDirectoryTests: XCTestCase {
+    func testUsesRemoteHomeWhenNoInitialPathIsConfigured() async throws {
+        let service = HomeDirectoryTransport(home: "/home/claude")
+        let viewModel = RemoteFileViewModel()
+        let server = ServerConfig(
+            alias: "tencent-claude",
+            hostname: "example.com",
+            username: "claude"
+        )
+
+        viewModel.loadInitialDirectory(
+            server: server,
+            service: service,
+            showHidden: false
+        )
+        try await waitUntil { viewModel.path == "/home/claude" }
+        viewModel.load(server: server, service: service, showHidden: false)
+        await fulfillment(of: [service.listed], timeout: 2)
+
+        XCTAssertEqual(viewModel.path, "/home/claude")
+        XCTAssertEqual(service.listedPaths, ["/home/claude"])
+    }
+
+    func testConfiguredInitialPathTakesPriorityOverRemoteHome() async throws {
+        let service = HomeDirectoryTransport(home: "/home/claude")
+        let viewModel = RemoteFileViewModel()
+        let server = ServerConfig(
+            alias: "custom",
+            hostname: "example.com",
+            username: "claude",
+            defaultRemotePath: "/srv/projects"
+        )
+
+        viewModel.loadInitialDirectory(
+            server: server,
+            service: service,
+            showHidden: false
+        )
+        try await waitUntil { viewModel.path == "/srv/projects" }
+        viewModel.load(server: server, service: service, showHidden: false)
+        await fulfillment(of: [service.listed], timeout: 2)
+
+        XCTAssertEqual(viewModel.path, "/srv/projects")
+        XCTAssertEqual(service.listedPaths, ["/srv/projects"])
+        XCTAssertEqual(service.homeDirectoryCallCount, 0)
+    }
+
+    func testTransferErrorExposesItsMessageToTheUI() {
+        let error = TransferError(code: "EACCES", message: "permission denied")
+        XCTAssertEqual(error.localizedDescription, "permission denied")
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @MainActor () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() >= deadline {
+                return XCTFail("Timed out waiting for initial remote directory")
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
+@MainActor
 final class TransferQueueCompressionRegressionTests: XCTestCase {
     func testOrdinaryFileUploadDoesNotAdvertiseGzipForRawBytes() async throws {
         let transport = RecordingTransport()
@@ -404,6 +471,36 @@ private final class RecordingTransport: FileTransport, @unchecked Sendable {
         cancellation: TransferCancellation,
         progress: @escaping @Sendable (Int64) -> Void
     ) async throws {}
+}
+
+private final class HomeDirectoryTransport: TransportStub, @unchecked Sendable {
+    let listed = XCTestExpectation(description: "initial directory listed")
+    private let lock = NSLock()
+    private let home: String
+    private var paths: [String] = []
+    private var homeCalls = 0
+
+    init(home: String) {
+        self.home = home
+    }
+
+    var listedPaths: [String] { lock.withLock { paths } }
+    var homeDirectoryCallCount: Int { lock.withLock { homeCalls } }
+
+    override func homeDirectory(_ server: ServerConfig) async throws -> String {
+        lock.withLock { homeCalls += 1 }
+        return home
+    }
+
+    override func list(
+        _ server: ServerConfig,
+        path: String,
+        showHidden: Bool
+    ) async throws -> [RemoteEntry] {
+        lock.withLock { paths.append(path) }
+        listed.fulfill()
+        return []
+    }
 }
 
 private final class DirectoryRecordingTransport: TransportStub, @unchecked Sendable {

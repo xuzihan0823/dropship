@@ -23,6 +23,7 @@ final class RemoteFileViewModel: ObservableObject {
     @Published var diskTotal: Int64?
 
     private var loadTask: Task<Void, Never>?
+    private var initialDirectoryRequestID: UUID?
 
     func navigate(to newPath: String) {
         guard newPath != path else { return }
@@ -45,7 +46,7 @@ final class RemoteFileViewModel: ObservableObject {
     }
 
     func load(server: ServerConfig,
-              service: RemoteFileServiceImpl,
+              service: any RemoteFileService,
               showHidden: Bool) {
         loadTask?.cancel()
         status = .loading
@@ -69,6 +70,49 @@ final class RemoteFileViewModel: ObservableObject {
                 await MainActor.run {
                     self.status = .failed(error.localizedDescription)
                 }
+            }
+        }
+    }
+
+    func loadInitialDirectory(
+        server: ServerConfig,
+        service: any RemoteFileService,
+        showHidden: Bool
+    ) {
+        loadTask?.cancel()
+        let requestID = UUID()
+        initialDirectoryRequestID = requestID
+        history.removeAll()
+        future.removeAll()
+        selection.removeAll()
+        entries.removeAll()
+        diskFree = nil
+        diskTotal = nil
+        status = .loading
+
+        loadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let initialPath: String
+                if let configured = server.defaultRemotePath,
+                   !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    initialPath = configured
+                } else {
+                    initialPath = try await service.homeDirectory(server)
+                }
+                try Task.checkCancellation()
+                guard self.initialDirectoryRequestID == requestID else { return }
+
+                if self.path == initialPath {
+                    self.load(server: server, service: service, showHidden: showHidden)
+                } else {
+                    self.path = initialPath
+                }
+            } catch is CancellationError {
+                // A newer server selection owns the view now.
+            } catch {
+                guard self.initialDirectoryRequestID == requestID else { return }
+                self.status = .failed(error.localizedDescription)
             }
         }
     }
@@ -317,11 +361,11 @@ struct RemoteFilePanel: View {
             vm.status = .idle
             return
         }
-        let initial = server.defaultRemotePath ?? "/root"
-        vm.history.removeAll()
-        vm.future.removeAll()
-        vm.path = initial
-        // onChange(of: vm.path) 会触发 reload
+        vm.loadInitialDirectory(
+            server: server,
+            service: env.remoteFiles,
+            showHidden: env.showHiddenFiles
+        )
     }
 
     private func reload() {

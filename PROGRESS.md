@@ -113,6 +113,18 @@ Mac 本机验证（2026-08-13）：`swift test` 共 30 项通过，`go test ./..
 状态测试覆盖。尚待真机端到端验证：开开关 → 服务器执行 dropship-send → 比对 md5 →
 关开关后应立刻失败。
 
+### 非 root 账号远程目录加载修复（2026-08-13）
+
+远程面板原先在未设置 `defaultRemotePath` 时固定打开 `/root`，导致 `tencent-claude`
+（登录用户 `claude`，家目录 `/home/claude`）刷新时收到 `EACCES`。现在连接后通过 agent
+查询当前用户家目录；显式配置的 `defaultRemotePath` 仍优先。`TransferError` 同时实现
+`LocalizedError`，权限等业务错误会显示真实 message，不再显示 `Dropship.TransferError error 1`。
+新增非 root 初始目录、显式路径优先和错误展示回归测试。
+
+真机界面验证：重启应用后选择并连接 `tencent-claude`，远端面包屑正确进入
+`/home/claude`，目录列表成功显示 `shared`、`projects`、`repair_repo.sh`；隧道状态及
+关闭按钮正常。`swift test` 共 33 项通过，`go test ./...` 通过。
+
 ### 大文件拖入远程区域卡死/退出修复（2026-08-12）
 
 现象是普通大文件拖入服务器区域后先卡住再退出，但 `.zip` 等压缩包可正常上传。

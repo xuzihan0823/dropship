@@ -133,7 +133,7 @@ public enum TransferState: Equatable, Sendable {
     case cancelled
 }
 
-public struct TransferError: Error, Equatable, Sendable {
+public struct TransferError: Error, LocalizedError, Equatable, Sendable {
     /// 对应 docs/PROTOCOL.md 第 4 节的稳定错误码。
     public var code: String
     public var message: String
@@ -144,6 +144,10 @@ public struct TransferError: Error, Equatable, Sendable {
         self.code = code
         self.message = message
         self.retryable = retryable
+    }
+
+    public var errorDescription: String? {
+        message.isEmpty ? code : message
     }
 }
 
