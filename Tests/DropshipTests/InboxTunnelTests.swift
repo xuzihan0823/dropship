@@ -10,6 +10,21 @@ import XCTest
 // 这几条是 PROTOCOL.md 2.2 那次事故（半截文件覆盖原文件）的同类风险。
 // ============================================================
 
+@MainActor
+final class TunnelServiceDefaultsTests: XCTestCase {
+    func testDefaultInboxLivesInDownloads() {
+        let preferencesURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dropship-tunnels-\(UUID().uuidString).json")
+        let service = TunnelService(preferencesURL: preferencesURL)
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads/Dropship", isDirectory: true)
+
+        XCTAssertEqual(service.inboxDirectory.standardizedFileURL, expected.standardizedFileURL)
+    }
+}
+
+// ============================================================
+
 final class InboxServerTests: XCTestCase {
     private var directory: URL!
     private var server: InboxServer!

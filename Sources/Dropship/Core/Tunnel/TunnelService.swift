@@ -42,7 +42,7 @@ final class TunnelService: ObservableObject {
         runner: SSHProcessRunner = .shared
     ) {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let inbox = inboxDirectory ?? home.appendingPathComponent("Desktop/Dropship", isDirectory: true)
+        let inbox = inboxDirectory ?? home.appendingPathComponent("Downloads/Dropship", isDirectory: true)
         self.inboxDirectory = inbox
         self.inboxServer = InboxServer(inboxDirectory: inbox)
         self.runner = runner

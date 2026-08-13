@@ -256,6 +256,9 @@ Content-Length: <N>
 
 ### 7.4 落地规则
 
+Mac 默认收件目录为 `~/Downloads/Dropship`。调用方可以在构造 `TunnelService` 时显式
+传入 `inboxDirectory` 覆盖该位置。
+
 1. 流式写入 `<收件箱>/.incoming/<uuid>.part`，全程不整文件进内存
 2. 收到的字节数**必须**等于 `Content-Length`，不等即判定截断
 3. 校验通过才**原子 rename** 进收件箱；不通过则**保留 `.part`、绝不 rename**
@@ -286,4 +289,3 @@ Content-Length: <N>
 - 服务器上**不存放任何能登录 Mac 的凭据**。拿到 token 的人只能**写**，且只能写进收件箱那一个目录，读不到 Mac 上的任何东西，也拿不到执行权限
 - 反过来说：服务器上任何能读 `inbox.env` 的用户（含 root）都能往你的收件箱塞文件。这是本方案的已知边界
 - 关闭开关会同时作废 token、杀掉 ssh 进程、删掉服务器上的两个文件，三重失效
-

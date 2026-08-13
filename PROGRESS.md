@@ -76,7 +76,7 @@ Mac: Dropship.app 内置收件端点 (127.0.0.1:随机端口，仅回环)
 ~/.local/share/dropship/dropship-send ./logs/          # 目录自动打包成 logs.tar.gz
 ```
 
-推回来的文件落在 `~/Desktop/Dropship`，同时出现在底部面板新增的「收件箱」分页里。
+推回来的文件默认落在 `~/Downloads/Dropship`，同时出现在底部面板新增的「收件箱」分页里。
 
 **为什么不直接把 Mac 的 sshd 反向转发出去**（远程登录本来就开着，scp 一步到位）：
 那需要把一把能登录 Mac 的私钥放到服务器上，服务器被入侵就等于 Mac 被入侵。
@@ -110,8 +110,11 @@ Mac: Dropship.app 内置收件端点 (127.0.0.1:随机端口，仅回环)
 Mac 本机验证（2026-08-13）：`swift test` 共 30 项通过，`go test ./...` 通过，
 `./scripts/build-app.sh` 成功生成并签名 `.app`，同时嵌入 linux/amd64 与 linux/arm64 agent。
 基线中 `ReverseTunnel` 无法在长驻 SSH 运行期间收到动态端口的问题也已修复，并由 active
-状态测试覆盖。尚待真机端到端验证：开开关 → 服务器执行 dropship-send → 比对 md5 →
-关开关后应立刻失败。
+状态测试覆盖。2026-08-13 已在 `tencent-claude` 真机执行 `dropship-send`，Mac 成功收件，
+远端与本地 SHA-256 一致；随后默认收件目录由 `~/Desktop/Dropship` 调整为
+`~/Downloads/Dropship`，并增加默认路径回归测试。重启新构建后再次从 `tencent-claude`
+推送测试文件，文件仅落入新目录、未落入旧目录，大小与 SHA-256 一致，App 收件箱列表
+也正确显示该记录。旧目录中的现有文件未迁移或删除。
 
 ### 非 root 账号远程目录加载修复（2026-08-13）
 
