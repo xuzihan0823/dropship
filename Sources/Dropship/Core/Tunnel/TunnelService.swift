@@ -25,14 +25,16 @@ final class TunnelService: ObservableObject {
     /// 给用户/agent 看的那行命令。
     static let sendCommand = "~/.local/share/dropship/dropship-send <文件或目录>"
 
-    let inboxDirectory: URL
+    @Published private(set) var inboxDirectory: URL
 
-    private let inboxServer: InboxServer
+    private var inboxServer: InboxServer
     private let runner: SSHProcessRunner
     private let preferencesURL: URL
     private let maxInboxItems = 200
+    private var customInboxDirectory: URL?
 
     private var tunnels: [UUID: ReverseTunnel] = [:]
+    private var tunnelTokens: [UUID: String] = [:]
     private var enabledServers: Set<UUID> = []
     private var knownServers: [UUID: ServerConfig] = [:]
 
@@ -42,20 +44,24 @@ final class TunnelService: ObservableObject {
         runner: SSHProcessRunner = .shared
     ) {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let inbox = inboxDirectory ?? home.appendingPathComponent("Downloads/Dropship", isDirectory: true)
+        let resolvedPreferencesURL = preferencesURL ?? home.appendingPathComponent(
+            "Library/Application Support/Dropship/tunnels.json"
+        )
+        let saved = Self.readPreferences(from: resolvedPreferencesURL)
+        let savedInbox = saved?.inboxDirectoryPath.map {
+            URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL
+        }
+        let explicitInbox = inboxDirectory?.standardizedFileURL
+        let inbox = explicitInbox ?? savedInbox ?? Self.defaultInboxDirectory(home: home)
         self.inboxDirectory = inbox
         self.inboxServer = InboxServer(inboxDirectory: inbox)
         self.runner = runner
-        self.preferencesURL = preferencesURL ?? home.appendingPathComponent(
-            "Library/Application Support/Dropship/tunnels.json"
-        )
+        self.preferencesURL = resolvedPreferencesURL
+        self.customInboxDirectory = savedInbox
+        self.enabledServers = Set(saved?.enabled ?? [])
 
-        loadPreferences()
         for id in enabledServers { states[id] = .disabled }
-
-        inboxServer.onReceive = { [weak self] received in
-            Task { @MainActor in self?.append(received) }
-        }
+        configureInboxCallback()
     }
 
     // MARK: - 查询
@@ -104,6 +110,7 @@ final class TunnelService: ObservableObject {
             teardown(server, cleanRemote: true)
         } else {
             tunnels.removeValue(forKey: serverID)?.stop()
+            tunnelTokens.removeValue(forKey: serverID)
             inboxServer.unregister(serverID)
             stopInboxServerIfIdle()
         }
@@ -118,20 +125,24 @@ final class TunnelService: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
+            let endpoint = self.inboxServer
             let port: UInt16
             do {
-                port = try await self.inboxServer.start()
+                port = try await endpoint.start()
             } catch {
                 self.states[server.id] = .failed(Self.describe(error))
                 return
             }
             // 中途被关掉了
-            guard self.enabledServers.contains(server.id), self.tunnels[server.id] == nil else { return }
+            guard self.enabledServers.contains(server.id),
+                  self.tunnels[server.id] == nil,
+                  self.inboxServer === endpoint else { return }
 
-            let token = self.inboxServer.register(server.id)
+            let token = endpoint.register(server.id)
             let tunnel = ReverseTunnel(server: server, localPort: port, runner: self.runner) { [weak self] event in
                 Task { @MainActor in self?.handle(event, for: server, token: token) }
             }
+            self.tunnelTokens[server.id] = token
             self.tunnels[server.id] = tunnel
             tunnel.start()
         }
@@ -139,6 +150,7 @@ final class TunnelService: ObservableObject {
 
     private func teardown(_ server: ServerConfig, cleanRemote: Bool) {
         let tunnel = tunnels.removeValue(forKey: server.id)
+        tunnelTokens.removeValue(forKey: server.id)
         tunnel?.stop()
         inboxServer.unregister(server.id)
         stopInboxServerIfIdle()
@@ -158,7 +170,7 @@ final class TunnelService: ObservableObject {
     }
 
     private func handle(_ event: ReverseTunnel.Event, for server: ServerConfig, token: String) {
-        guard tunnels[server.id] != nil else { return }
+        guard tunnels[server.id] != nil, tunnelTokens[server.id] == token else { return }
         switch event {
         case .active(let remotePort):
             states[server.id] = .active(remotePort: remotePort)
@@ -213,6 +225,76 @@ final class TunnelService: ObservableObject {
 
     // MARK: - 收件箱
 
+    static func defaultInboxDirectory(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        home.appendingPathComponent("Downloads/Dropship", isDirectory: true)
+    }
+
+    /// 修改收件箱位置并持久化。正在运行的隧道会换到新的本地收件端点。
+    func setInboxDirectory(_ directory: URL) throws {
+        try updateInboxDirectory(directory, persistAsCustom: true)
+    }
+
+    private func updateInboxDirectory(_ directory: URL, persistAsCustom: Bool) throws {
+        guard directory.isFileURL else {
+            throw TransferError(code: "EINVAL", message: "收件箱必须是本机文件夹")
+        }
+        let normalized = directory.standardizedFileURL
+        do {
+            try FileManager.default.createDirectory(at: normalized, withIntermediateDirectories: true)
+        } catch {
+            throw TransferError(code: "EACCES", message: "无法创建收件箱：\(error.localizedDescription)")
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: normalized.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw TransferError(code: "ENOTDIR", message: "选择的位置不是文件夹")
+        }
+        guard FileManager.default.isWritableFile(atPath: normalized.path) else {
+            throw TransferError(code: "EACCES", message: "所选文件夹不可写")
+        }
+
+        let previousCustomDirectory = customInboxDirectory
+        customInboxDirectory = persistAsCustom ? normalized : nil
+        guard savePreferences() else {
+            customInboxDirectory = previousCustomDirectory
+            throw TransferError(code: "EIO", message: "无法保存收件箱位置")
+        }
+        if normalized == inboxDirectory.standardizedFileURL { return }
+
+        let restartIDs = Set(tunnels.keys).union(
+            enabledServers.filter {
+                if case .starting = states[$0] { return true }
+                return false
+            }
+        )
+        let serversToRestart = restartIDs.compactMap { knownServers[$0] }
+        for server in serversToRestart {
+            // 新隧道会覆盖服务器端配置；不要让旧清理任务与新配置竞态。
+            teardown(server, cleanRemote: false)
+            states[server.id] = .disabled
+        }
+        inboxServer.stop()
+
+        let replacement = InboxServer(inboxDirectory: normalized)
+        inboxServer = replacement
+        inboxDirectory = normalized
+        customInboxDirectory = persistAsCustom ? normalized : nil
+        configureInboxCallback()
+
+        for server in serversToRestart where enabledServers.contains(server.id) {
+            activate(server)
+        }
+    }
+
+    private func configureInboxCallback() {
+        inboxServer.onReceive = { [weak self] received in
+            Task { @MainActor in self?.append(received) }
+        }
+    }
+
     private func append(_ received: InboxServer.Received) {
         inbox.insert(
             InboxItem(
@@ -237,22 +319,31 @@ final class TunnelService: ObservableObject {
 
     private struct Preferences: Codable {
         var enabled: [UUID]
+        var inboxDirectoryPath: String?
     }
 
-    private func loadPreferences() {
-        guard let data = try? Data(contentsOf: preferencesURL),
-              let saved = try? JSONDecoder().decode(Preferences.self, from: data) else { return }
-        enabledServers = Set(saved.enabled)
+    private static func readPreferences(from url: URL) -> Preferences? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(Preferences.self, from: data)
     }
 
-    private func savePreferences() {
-        let payload = Preferences(enabled: Array(enabledServers))
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? FileManager.default.createDirectory(
-            at: preferencesURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+    @discardableResult
+    private func savePreferences() -> Bool {
+        let payload = Preferences(
+            enabled: Array(enabledServers),
+            inboxDirectoryPath: customInboxDirectory?.path
         )
-        try? data.write(to: preferencesURL, options: .atomic)
+        guard let data = try? JSONEncoder().encode(payload) else { return false }
+        do {
+            try FileManager.default.createDirectory(
+                at: preferencesURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: preferencesURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: - 工具

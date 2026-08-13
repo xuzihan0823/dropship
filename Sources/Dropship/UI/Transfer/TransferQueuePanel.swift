@@ -17,6 +17,7 @@ struct TransferQueuePanel: View {
     @ObservedObject private var queue: TransferQueue
     @ObservedObject private var tunnels: TunnelService
     @State private var tab: Tab = .transfers
+    @State private var inboxLocationError: String?
 
     init(queue: TransferQueue, tunnels: TunnelService) {
         self.queue = queue
@@ -36,6 +37,17 @@ struct TransferQueuePanel: View {
         }
         .background(.regularMaterial)
         .frame(maxHeight: env.transferPanelExpanded ? .infinity : nil)
+        .alert(
+            "无法修改收件箱",
+            isPresented: Binding(
+                get: { inboxLocationError != nil },
+                set: { if !$0 { inboxLocationError = nil } }
+            )
+        ) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(inboxLocationError ?? "未知错误")
+        }
     }
 
     // MARK: - 顶部工具栏
@@ -69,6 +81,13 @@ struct TransferQueuePanel: View {
                 Text("\(queue.activeCount) 个进行中 · \(queue.taskCount) 个任务")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else if tab == .inbox {
+                Text(tunnels.inboxDirectory.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(tunnels.inboxDirectory.path)
             }
 
             Spacer()
@@ -96,6 +115,14 @@ struct TransferQueuePanel: View {
                 .controlSize(.small)
                 .disabled(queue.finishedCount == 0)
             } else {
+                Button {
+                    chooseInboxDirectory()
+                } label: {
+                    Label("修改位置…", systemImage: "folder.badge.gearshape")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
                 Button {
                     _ = NSWorkspace.shared.open(tunnels.inboxDirectory)
                 } label: {
@@ -221,6 +248,25 @@ struct TransferQueuePanel: View {
     }
 
     // MARK: - 收件箱
+
+    private func chooseInboxDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "选择收件箱位置"
+        panel.message = "服务器回传的文件将直接保存到所选文件夹"
+        panel.prompt = "选择"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = tunnels.inboxDirectory
+
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        do {
+            try tunnels.setInboxDirectory(directory)
+        } catch {
+            inboxLocationError = TunnelService.describe(error)
+        }
+    }
 
     @ViewBuilder
     private var inboxList: some View {

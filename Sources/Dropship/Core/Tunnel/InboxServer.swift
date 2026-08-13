@@ -76,8 +76,7 @@ final class InboxServer: @unchecked Sendable {
 
         // 调用方通常在主线程上 await，建目录和清过期 .part 别占着主线程做。
         try await Task.detached(priority: .utility) { [self] in
-            try FileManager.default.createDirectory(at: inboxDirectory, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+            try ensureDirectories()
             purgeStaleParts()
         }.value
 
@@ -231,6 +230,12 @@ final class InboxServer: @unchecked Sendable {
     }
 
     // MARK: - 落地
+
+    /// 收件目录可能被用户在 Finder 中删除；每个上传开始前都重新确保目录存在。
+    fileprivate func ensureDirectories() throws {
+        try FileManager.default.createDirectory(at: inboxDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+    }
 
     /// 把校验通过的 .part 挪到收件箱，返回最终 URL。重名不覆盖，自动 name-1.ext。
     fileprivate func promote(partURL: URL, preferredName: String) throws -> URL {
@@ -442,6 +447,12 @@ private final class InboxConnection: @unchecked Sendable {
         }
         guard length >= 0, length <= InboxServer.maxFileBytes else {
             respond(413, code: "EPROTO", message: "文件超过上限 \(InboxServer.maxFileBytes) 字节")
+            return
+        }
+        do {
+            try server.ensureDirectories()
+        } catch {
+            respond(500, code: "EINTERNAL", message: "无法创建收件箱：\(error.localizedDescription)")
             return
         }
         guard server.hasRoom(for: length) else {

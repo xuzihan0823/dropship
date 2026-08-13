@@ -21,6 +21,41 @@ final class TunnelServiceDefaultsTests: XCTestCase {
 
         XCTAssertEqual(service.inboxDirectory.standardizedFileURL, expected.standardizedFileURL)
     }
+
+    func testCustomInboxLocationPersists() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dropship-location-\(UUID().uuidString)", isDirectory: true)
+        let preferencesURL = root.appendingPathComponent("tunnels.json")
+        let customDirectory = root.appendingPathComponent("custom-inbox", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let service = TunnelService(preferencesURL: preferencesURL)
+        try service.setInboxDirectory(customDirectory)
+        let restored = TunnelService(preferencesURL: preferencesURL)
+
+        XCTAssertEqual(
+            restored.inboxDirectory.standardizedFileURL,
+            customDirectory.standardizedFileURL
+        )
+    }
+
+    func testLegacyPreferencesWithoutInboxLocationStillLoad() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dropship-legacy-preferences-\(UUID().uuidString)", isDirectory: true)
+        let preferencesURL = root.appendingPathComponent("tunnels.json")
+        let serverID = UUID()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("{\"enabled\":[\"\(serverID.uuidString)\"]}".utf8).write(to: preferencesURL)
+
+        let service = TunnelService(preferencesURL: preferencesURL)
+
+        XCTAssertTrue(service.isEnabled(serverID))
+        XCTAssertEqual(
+            service.inboxDirectory.standardizedFileURL,
+            TunnelService.defaultInboxDirectory().standardizedFileURL
+        )
+    }
 }
 
 // ============================================================
@@ -118,6 +153,32 @@ final class InboxServerTests: XCTestCase {
         XCTAssertEqual(received.filename, "报告.txt")
         XCTAssertEqual(received.bytes, Int64(payload.count))
         XCTAssertEqual(try Data(contentsOf: received.url), payload)
+    }
+
+    func testRecreatesDeletedInboxOnNextUpload() async throws {
+        let port = try await server.start()
+        let serverID = UUID()
+        let token = server.register(serverID)
+        try FileManager.default.removeItem(at: directory)
+
+        let payload = Data("recreated".utf8)
+        let arrived = expectation(description: "onReceive after directory recreation")
+        server.onReceive = { _ in arrived.fulfill() }
+        let response = RawHTTPClient(port: port).perform(
+            head: Self.head([
+                "PUT /recreated.txt HTTP/1.1",
+                "Authorization: Bearer \(token)",
+                "Content-Length: \(payload.count)"
+            ]),
+            body: payload
+        )
+
+        await fulfillment(of: [arrived], timeout: 10)
+        XCTAssertTrue(response.hasPrefix("HTTP/1.1 201"), response)
+        XCTAssertEqual(
+            try Data(contentsOf: directory.appendingPathComponent("recreated.txt")),
+            payload
+        )
     }
 
     func testRejectsMissingAndWrongToken() async throws {

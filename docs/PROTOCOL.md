@@ -256,8 +256,9 @@ Content-Length: <N>
 
 ### 7.4 落地规则
 
-Mac 默认收件目录为 `~/Downloads/Dropship`。调用方可以在构造 `TunnelService` 时显式
-传入 `inboxDirectory` 覆盖该位置。
+Mac 默认收件目录为 `~/Downloads/Dropship`。用户可以在 App 的「收件箱」分页选择其他
+本机文件夹，路径与隧道开关一起持久化在 `tunnels.json`；切换时，已开启的隧道会自动
+重建并改用新目录。调用方也可以在构造 `TunnelService` 时显式传入 `inboxDirectory`。
 
 1. 流式写入 `<收件箱>/.incoming/<uuid>.part`，全程不整文件进内存
 2. 收到的字节数**必须**等于 `Content-Length`，不等即判定截断
@@ -266,6 +267,7 @@ Mac 默认收件目录为 `~/Downloads/Dropship`。调用方可以在构造 `Tun
    `PUT /../../../../etc/passwd` 只会落成收件箱里的 `passwd`
 5. 同名不覆盖，自动 `name-1.ext`
 6. 未完成的 `.part` 保留 7 天，之后在下次启动时清理
+7. 收件目录在 Finder 中被删除后，下一次上传会先自动重建目录与 `.incoming`
 
 > 第 2、3 条与 2.2 节 `--recv` 的规矩是同一条：那次半截文件覆盖掉服务器原文件的
 > 事故，根因就是"没校验字节数就 rename"。收件方向必须守同样的底线。
