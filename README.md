@@ -124,6 +124,4 @@ swift test                  # 运行测试
 
 修改 Agent 或客户端传输实现前，请先阅读 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
-## License
 
-待定。
