@@ -7,7 +7,7 @@ Mac 文件，右侧浏览服务器文件，拖过去即可传输。
 
 **当前版本：0.2.0 · macOS 14+ · Apple Silicon**
 
-![Dropship 主界面](./image.png)
+![Dropship 主界面](./dropship-overview.png)
 
 ## 核心能力
 
