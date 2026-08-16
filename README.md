@@ -10,12 +10,19 @@ Mac 与 Linux 服务器之间的拖拽式文件互传工具。macOS 原生 Swift
 
 ## 安装
 
-目前没有预编译版本，从源码构建：
+### 使用 DMG 安装（推荐）
+
+从 [GitHub Releases](https://github.com/xuzihan0823/dropship/releases) 下载
+`Dropship-v0.2.0-macos-arm64.dmg`，打开后将 `Dropship.app` 拖入 `Applications`。
+
+当前预编译版本面向 Apple Silicon Mac（arm64）。
+
+### 从源码构建
 
 ```bash
 git clone https://github.com/xuzihan0823/dropship.git
 cd dropship
-./scripts/build-app.sh
+./scripts/build-app.sh release
 open build/Dropship.app
 ```
 
@@ -23,10 +30,10 @@ open build/Dropship.app
 
 ### Gatekeeper 提示
 
-应用使用 ad-hoc 签名，**没有 Apple 开发者证书，也未经公证**。从别处下载的话 macOS 会拒绝打开，需要手动解除隔离：
+应用使用 ad-hoc 签名，**没有 Developer ID 分发签名，也未经 Apple 公证**。首次打开下载的版本时，macOS 可能会阻止运行；可在系统设置的“隐私与安全性”中选择仍要打开，或者执行：
 
 ```bash
-xattr -dr com.apple.quarantine /path/to/Dropship.app
+xattr -dr com.apple.quarantine /Applications/Dropship.app
 ```
 
 自己构建的产物不受此限制。
@@ -103,9 +110,10 @@ agent 的完整协议契约在 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)，源码�
 ## 开发
 
 ```bash
-swift build          # 编译
-swift test           # 运行测试
-./scripts/build-app.sh   # 构建 .app bundle（含 Go agent）
+swift build                 # 编译
+swift test                  # 运行测试
+./scripts/build-app.sh      # 构建 .app bundle（含 Go agent）
+./scripts/build-dmg.sh      # 构建 release DMG 与 SHA-256
 ```
 
 开发进度、设计决策和历次缺陷的根因分析记录在 [`PROGRESS.md`](PROGRESS.md)。agent 协议契约在 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)，修改前请先读——里面有几条是真机实测教训换来的硬性要求。

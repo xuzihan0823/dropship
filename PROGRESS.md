@@ -56,6 +56,18 @@ ssh <host> '~/.local/share/dropship/agent --version'
 
 ## 质量记录
 
+### GitHub Release DMG 打包（2026-08-16）
+
+新增 `scripts/build-dmg.sh`：先执行 release 配置的应用和双架构 Linux agent 构建，
+再从 `Info.plist` 与实际 Mach-O 读取版本和架构，生成带 `Dropship.app`、`Applications`
+快捷方式的压缩只读 DMG，同时输出 SHA-256 校验文件。产物按真实架构命名，当前为
+`Dropship-v0.2.0-macos-arm64.dmg`，避免把单架构应用误标成通用版本。
+
+已验证 DMG 镜像校验、只读挂载、目录内容、Applications 链接、包内版本/标识符/架构、
+两套 Linux agent 和嵌入式代码签名；生成文件为 3,256,904 字节，SHA-256 复核通过。
+当前机器没有 `Developer ID Application` 分发证书，应用仍是 ad-hoc 签名且未经 Apple
+公证，因此 Gatekeeper 拒绝是预期结果；README 已明确首次打开的系统设置与解除隔离方法。
+
 ### 本地文件右键打开与双击打开修复（2026-08-16）
 
 本地文件表在改用 `TableRow` 原生拖放时删掉了旧的双击手势，但 `onOpen` 没有迁移到
