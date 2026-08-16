@@ -18,6 +18,12 @@ final class LocalFileViewModel: ObservableObject {
     @Published var history: [URL] = []
     @Published var future: [URL] = []
 
+    private let openFile: (URL) -> Bool
+
+    init(openFile: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
+        self.openFile = openFile
+    }
+
     private func fm() -> FileManager { FileManager.default }
 
     func navigate(to newURL: URL) {
@@ -37,12 +43,16 @@ final class LocalFileViewModel: ObservableObject {
 
     var canGoBack: Bool { !history.isEmpty }
 
-    func openEntry(_ row: FileRow) {
+    @discardableResult
+    func openEntry(_ row: FileRow) -> Bool {
         let target = URL(fileURLWithPath: row.path)
         var isDir: ObjCBool = false
-        if fm().fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue {
+        guard fm().fileExists(atPath: target.path, isDirectory: &isDir) else { return false }
+        if isDir.boolValue {
             navigate(to: target)
+            return true
         }
+        return openFile(target)
     }
 
     func reload() {
@@ -97,6 +107,17 @@ final class LocalFileViewModel: ObservableObject {
     }
 }
 
+/// 「上传到远程」的目标目录解析。抽成纯函数，是为了把"绝不回退到硬编码路径"
+/// 这条规则钉在测试里——早期版本写死 `/root`，非 root 账号会把文件传到
+/// 没有权限、也不是用户想要的位置。
+enum UploadDestination {
+    static func resolve(remotePath: String) -> String? {
+        let trimmed = remotePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return nil }
+        return trimmed
+    }
+}
+
 struct LocalFilePanel: View {
     @StateObject private var vm = LocalFileViewModel()
     @EnvironmentObject private var env: AppEnvironment
@@ -104,6 +125,8 @@ struct LocalFilePanel: View {
     @State private var showNewFolder = false
     @State private var newFolderName = ""
     @State private var confirmDelete: [FileRow]?
+    /// 删除/移动/新建失败时的提示。以前这些错误是直接丢掉的，用户只会觉得"点了没反应"。
+    @State private var actionError: String?
 
     init(queue: TransferQueue) {
         self.queue = queue
@@ -119,6 +142,11 @@ struct LocalFilePanel: View {
         .toolbar { toolbar }
         .onAppear {
             vm.reload()
+            // 同步给远程面板，「下载到本地」要靠它决定目标目录
+            env.currentLocalDirectory = vm.url
+        }
+        .onChange(of: vm.url) { _, newURL in
+            env.currentLocalDirectory = newURL
         }
         // 下载结束后自动刷新，否则刚取回的文件不会出现在列表里
         .onChange(of: finishedTransferSignature) { _, _ in
@@ -130,6 +158,14 @@ struct LocalFilePanel: View {
             Button("创建") { createFolder() }
         } message: {
             Text("请输入新文件夹名称")
+        }
+        .alert("操作失败", isPresented: Binding(
+            get: { actionError != nil },
+            set: { if !$0 { actionError = nil } }
+        )) {
+            Button("好", role: .cancel) { actionError = nil }
+        } message: {
+            Text(actionError ?? "未知错误")
         }
         .alert("确认删除", isPresented: Binding(
             get: { confirmDelete != nil },
@@ -155,7 +191,10 @@ struct LocalFilePanel: View {
         case .loading where vm.entries.isEmpty:
             FilePanelStatusView(status: .loading)
         case .empty:
+            // 空目录下没有表格兜底，占位视图自己要能接收投放
             FilePanelStatusView(status: .empty)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .fileDropCatcher { urls in handleDrop(urls, into: vm.url) }
         case .failed(let msg):
             FilePanelStatusView(status: .failed(msg))
         default:
@@ -164,16 +203,16 @@ struct LocalFilePanel: View {
                     entries: vm.entries,
                     sortOrder: $vm.sortOrder,
                     selection: $vm.selection,
-                    onOpen: { row in vm.openEntry(row) },
+                    onOpen: { row in openEntry(row) },
                     onContextMenu: { selectedRows in
                         AnyView(contextMenu(for: selectedRows))
                     },
                     dragProviderForRow: { row in
                         NSItemProvider(object: URL(fileURLWithPath: row.path) as NSURL)
                     },
-                    onDrop: { urls in handleMoveInto(urls) },
+                    onDrop: { urls in handleDrop(urls, into: vm.url) },
                     onDropInto: { urls, row in
-                        handleMoveInto(urls, into: URL(fileURLWithPath: row.path))
+                        handleDrop(urls, into: URL(fileURLWithPath: row.path))
                     }
                 )
                 if case .loading = vm.status {
@@ -234,35 +273,42 @@ struct LocalFilePanel: View {
 
     @ViewBuilder
     private func contextMenu(for rows: [FileRow]) -> some View {
-        Button {
-            uploadToRemote(rows)
-        } label: {
-            Label("上传到远程", systemImage: "arrow.up.circle")
-        }
-        Divider()
-        Button(role: .destructive) {
-            confirmDelete = rows
-        } label: {
-            Label("删除", systemImage: "trash")
-        }
-        Divider()
-        Button {
-            if let path = rows.first?.path {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(path, forType: .string)
+        if !rows.isEmpty {
+            if rows.count == 1, let row = rows.first {
+                Button {
+                    openEntry(row)
+                } label: {
+                    Label(
+                        row.isDir ? "打开文件夹" : "打开文件",
+                        systemImage: row.isDir ? "folder" : "doc"
+                    )
+                }
+                Divider()
             }
-        } label: {
-            Label("拷贝路径", systemImage: "doc.on.doc")
-        }
-        .disabled(rows.count != 1)
-        Button {
-            if let row = rows.first {
-                vm.openEntry(row)
+            Button {
+                uploadToRemote(rows)
+            } label: {
+                Label(uploadMenuTitle, systemImage: "arrow.up.circle")
             }
-        } label: {
-            Label("打开", systemImage: "arrow.right.circle")
+            .disabled(env.selectedServer == nil
+                      || UploadDestination.resolve(remotePath: env.currentRemotePath) == nil)
+            Divider()
+            Button(role: .destructive) {
+                confirmDelete = rows
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+            Divider()
+            Button {
+                if let path = rows.first?.path {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(path, forType: .string)
+                }
+            } label: {
+                Label("拷贝路径", systemImage: "doc.on.doc")
+            }
+            .disabled(rows.count != 1)
         }
-        .disabled(rows.count != 1 || !rows.first!.isDir)
     }
 
     // MARK: - 操作
@@ -273,48 +319,148 @@ struct LocalFilePanel: View {
         queue.finishedTransferRevision
     }
 
+    /// 菜单里直接写出目标目录，避免用户不清楚文件会落到远端哪里。
+    private var uploadMenuTitle: String {
+        let dir = env.currentRemotePath
+        return dir.isEmpty ? "上传到远程" : "上传到 \(dir)"
+    }
+
+    private func openEntry(_ row: FileRow) {
+        guard vm.openEntry(row) else {
+            actionError = "无法打开「\(row.name)」，文件可能已被移动或没有可用的默认应用"
+            return
+        }
+        vm.selection = [row.id]
+    }
+
+    private func handleDrop(_ urls: [URL], into targetDirectory: URL) {
+        let payloads = LocalFileDropPayloads.classify(urls)
+        if !payloads.localURLs.isEmpty {
+            handleMoveInto(payloads.localURLs, into: targetDirectory)
+        }
+        if !payloads.remotePayloads.isEmpty {
+            handleDownload(payloads.remotePayloads, into: targetDirectory)
+        }
+    }
+
     private func handleMoveInto(_ urls: [URL], into destDir: URL? = nil) {
         // Finder 拖入本地面板：把文件移入目标目录
         let dest = destDir ?? vm.url
         let fm = FileManager.default
+        var failures: [String] = []
         for u in urls {
             let target = dest.appendingPathComponent(u.lastPathComponent)
-            if fm.fileExists(atPath: target.path) { continue }
+            if fm.fileExists(atPath: target.path) {
+                failures.append("\(u.lastPathComponent)：目标目录中已存在同名项")
+                continue
+            }
             do {
                 try fm.moveItem(at: u, to: target)
             } catch {
-                // 失败忽略
+                failures.append("\(u.lastPathComponent)：\(error.localizedDescription)")
             }
         }
+        reportIfNeeded(failures)
         vm.reload()
     }
 
+    private func handleDownload(
+        _ payloads: [RemoteFileDragPayload],
+        into targetDirectory: URL
+    ) {
+        guard let server = env.selectedServer else {
+            actionError = "请先在左侧选择一台服务器"
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let plans = try payloads.map {
+                    try RemoteDownloadPlan.make(
+                        payload: $0,
+                        targetDirectory: targetDirectory,
+                        selectedServerID: server.id
+                    )
+                }
+                var entries: [RemoteEntry] = []
+                for plan in plans {
+                    entries.append(try await env.remoteFiles.stat(server, path: plan.sourcePath))
+                }
+                guard let localDirectory = plans.first?.localDirectory else { return }
+                env.transferQueue.enqueueDownload(
+                    entries: entries,
+                    from: server,
+                    localDir: localDirectory,
+                    policy: .ask
+                )
+            } catch {
+                actionError = AppEnvironment.describe(error)
+            }
+        }
+    }
+
     private func uploadToRemote(_ rows: [FileRow]) {
-        guard let server = env.selectedServer else { return }
+        guard let server = env.selectedServer else {
+            actionError = "请先在左侧选择一台服务器"
+            return
+        }
+        // 目标目录取远程面板当前所在目录。以前这里写死 /root，
+        // 非 root 账号会传到没有权限、也不是用户想要的位置。
+        guard let remoteDir = UploadDestination.resolve(remotePath: env.currentRemotePath) else {
+            actionError = "请先连接服务器，并在右侧打开要上传到的远程目录"
+            return
+        }
         let urls = rows.map { URL(fileURLWithPath: $0.path) }
-        // remoteDir 需要从远程面板拿到，这里用一个简化路径
         env.transferQueue.enqueueUpload(
             localURLs: urls,
             to: server,
-            remoteDir: "/root",
+            remoteDir: remoteDir,
             policy: .ask
         )
     }
 
     private func deleteEntries(_ rows: [FileRow]) {
         let fm = FileManager.default
+        var failures: [String] = []
         for row in rows {
-            try? fm.removeItem(atPath: row.path)
-            vm.selection.remove(row.id)
+            do {
+                try fm.removeItem(atPath: row.path)
+                vm.selection.remove(row.id)
+            } catch {
+                failures.append("\(row.name)：\(error.localizedDescription)")
+            }
         }
+        reportIfNeeded(failures)
         vm.reload()
     }
 
     private func createFolder() {
-        let target = vm.url.appendingPathComponent(newFolderName)
-        try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
-        newFolderName = ""
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            actionError = "文件夹名称不能为空"
+            return
+        }
+        guard name != ".", name != "..", !name.contains("/") else {
+            actionError = "请输入当前目录下的单个文件夹名称"
+            return
+        }
+        let target = vm.url.appendingPathComponent(name)
+        do {
+            try FileManager.default.createDirectory(
+                at: target,
+                withIntermediateDirectories: false
+            )
+            newFolderName = ""
+        } catch {
+            actionError = error.localizedDescription
+        }
         vm.reload()
+    }
+
+    /// 逐项收集失败原因后一次性提示，避免多选操作弹出一连串弹窗。
+    private func reportIfNeeded(_ failures: [String]) {
+        guard !failures.isEmpty else { return }
+        actionError = failures.joined(separator: "\n")
     }
 }
 

@@ -29,6 +29,9 @@ public struct ServerConfig: Identifiable, Codable, Hashable, Sendable {
     public var defaultRemotePath: String?
     /// 收藏的远程路径。
     public var favorites: [String]
+    /// 是否允许把 Dropship agent 二进制上传到这台服务器并执行。
+    /// 关闭后该服务器只走 SFTP 降级路径。
+    public var allowAgentDeploy: Bool = true
 
     public enum Source: String, Codable, Sendable {
         case sshConfig   // 从 ~/.ssh/config 导入
@@ -46,7 +49,8 @@ public struct ServerConfig: Identifiable, Codable, Hashable, Sendable {
         proxyJump: String? = nil,
         source: Source = .manual,
         defaultRemotePath: String? = nil,
-        favorites: [String] = []
+        favorites: [String] = [],
+        allowAgentDeploy: Bool = true
     ) {
         self.id = id
         self.alias = alias
@@ -59,6 +63,29 @@ public struct ServerConfig: Identifiable, Codable, Hashable, Sendable {
         self.source = source
         self.defaultRemotePath = defaultRemotePath
         self.favorites = favorites
+        self.allowAgentDeploy = allowAgentDeploy
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, alias, displayName, hostname, port, username
+        case identityFile, proxyJump, source, defaultRemotePath, favorites
+        case allowAgentDeploy
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        alias = try container.decode(String.self, forKey: .alias)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        hostname = try container.decode(String.self, forKey: .hostname)
+        port = try container.decode(Int.self, forKey: .port)
+        username = try container.decode(String.self, forKey: .username)
+        identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
+        proxyJump = try container.decodeIfPresent(String.self, forKey: .proxyJump)
+        source = try container.decode(Source.self, forKey: .source)
+        defaultRemotePath = try container.decodeIfPresent(String.self, forKey: .defaultRemotePath)
+        favorites = try container.decodeIfPresent([String].self, forKey: .favorites) ?? []
+        allowAgentDeploy = try container.decodeIfPresent(Bool.self, forKey: .allowAgentDeploy) ?? true
     }
 }
 
@@ -126,6 +153,7 @@ public enum TransferState: Equatable, Sendable {
     case preparing      // 计算哈希 / 探测远端
     case transferring
     case verifying      // 校验哈希
+    case awaitingDecision // 目标已存在，等待用户选择处理方式
     case completed
     case skipped        // 秒传命中，内容一致，无需传输
     case paused
@@ -209,6 +237,34 @@ public enum ConflictPolicy: String, Sendable {
     case overwrite  // 直接覆盖
     case skip       // 跳过
     case rename     // 自动重命名为 name-1.ext
+}
+
+/// 一项等待用户选择处理方式的同名文件冲突。
+public struct PendingTransferConflict: Identifiable, Equatable, Sendable {
+    public let taskID: UUID
+    public let filename: String
+    public let destinationPath: String
+    public let direction: TransferDirection
+    public let sourceBytes: Int64
+    public let destinationBytes: Int64?
+
+    public var id: UUID { taskID }
+
+    public init(
+        taskID: UUID,
+        filename: String,
+        destinationPath: String,
+        direction: TransferDirection,
+        sourceBytes: Int64,
+        destinationBytes: Int64?
+    ) {
+        self.taskID = taskID
+        self.filename = filename
+        self.destinationPath = destinationPath
+        self.direction = direction
+        self.sourceBytes = sourceBytes
+        self.destinationBytes = destinationBytes
+    }
 }
 
 // MARK: - 反向收件隧道

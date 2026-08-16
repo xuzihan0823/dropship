@@ -7,6 +7,35 @@ import UniformTypeIdentifiers
 // 远程文件面板：浏览服务器目录、上传/下载、增删改。
 // ============================================================
 
+/// 「下载到本地」的目标目录解析。抽成纯函数，是为了把"绝不回退到硬编码路径"
+/// 这条规则钉在测试里--与 UploadDestination 对称：右键下载曾经写死 ~/Downloads，
+/// 既不跟本地面板当前目录，也和拖拽下载（落到拖放目标目录）行为不一致。
+enum DownloadDestination {
+    static func resolve(localDirectory: URL, fileManager: FileManager = .default) -> URL? {
+        let path = localDirectory.path
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDir),
+              isDir.boolValue,
+              fileManager.isWritableFile(atPath: path) else { return nil }
+        return localDirectory
+    }
+}
+
+extension View {
+    /// 「message 非 nil 则弹窗，点好清空」的统一错误提示。四个同形弹窗会让
+    /// body 的类型检查超时，抽成一个 modifier 才能编译通过。
+    func errorAlert(title: String, message: Binding<String?>) -> some View {
+        alert(title, isPresented: Binding(
+            get: { message.wrappedValue != nil },
+            set: { if !$0 { message.wrappedValue = nil } }
+        )) {
+            Button("好", role: .cancel) { message.wrappedValue = nil }
+        } message: {
+            Text(message.wrappedValue ?? "未知错误")
+        }
+    }
+}
+
 @MainActor
 final class RemoteFileViewModel: ObservableObject {
     @Published var path: String = ""
@@ -127,6 +156,10 @@ struct RemoteFilePanel: View {
     @State private var newFolderName = ""
     @State private var folderError: String?
     @State private var moveError: String?
+    /// 删除失败原因。以前是直接吞掉的，用户只看到列表没变化。
+    @State private var deleteError: String?
+    /// 下载目标目录不可用时的提示。宁可报错也不静默回退到 ~/Downloads。
+    @State private var downloadError: String?
     @State private var confirmDelete: [RemoteEntry]?
 
     init(queue: TransferQueue) {
@@ -156,7 +189,9 @@ struct RemoteFilePanel: View {
         .onChange(of: env.showHiddenFiles) { _, _ in
             reload()
         }
-        .onChange(of: vm.path) { _, _ in
+        .onChange(of: vm.path) { _, newPath in
+            // 同步给本地面板，「上传到远程」要靠它决定目标目录
+            env.currentRemotePath = newPath
             reload()
         }
         // 传输结束后自动刷新，否则刚传上去的文件不会出现在列表里
@@ -170,22 +205,10 @@ struct RemoteFilePanel: View {
         } message: {
             Text("请输入新文件夹名称")
         }
-        .alert("创建文件夹失败", isPresented: Binding(
-            get: { folderError != nil },
-            set: { if !$0 { folderError = nil } }
-        )) {
-            Button("好", role: .cancel) { folderError = nil }
-        } message: {
-            Text(folderError ?? "未知错误")
-        }
-        .alert("移动失败", isPresented: Binding(
-            get: { moveError != nil },
-            set: { if !$0 { moveError = nil } }
-        )) {
-            Button("好", role: .cancel) { moveError = nil }
-        } message: {
-            Text(moveError ?? "未知错误")
-        }
+        .errorAlert(title: "创建文件夹失败", message: $folderError)
+        .errorAlert(title: "移动失败", message: $moveError)
+        .errorAlert(title: "删除失败", message: $deleteError)
+        .errorAlert(title: "下载失败", message: $downloadError)
         .alert("确认删除", isPresented: Binding(
             get: { confirmDelete != nil },
             set: { if !$0 { confirmDelete = nil } }
@@ -213,7 +236,10 @@ struct RemoteFilePanel: View {
         case .loading where vm.entries.isEmpty:
             FilePanelStatusView(status: .loading)
         case .empty:
+            // 空目录下没有表格兜底，占位视图自己要能接收投放
             FilePanelStatusView(status: .empty)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .fileDropCatcher { urls in handleDrop(urls, into: vm.path) }
         case .failed(let msg):
             FilePanelStatusView(status: .failed(msg))
         default:
@@ -326,7 +352,7 @@ struct RemoteFilePanel: View {
         Button {
             downloadSelected(selected)
         } label: {
-            Label("下载到本地", systemImage: "arrow.down.circle")
+            Label(downloadMenuTitle, systemImage: "arrow.down.circle")
         }
         Divider()
         Button(role: .destructive) {
@@ -443,10 +469,31 @@ struct RemoteFilePanel: View {
         }
     }
 
+    /// 菜单里直接写出目标目录，避免用户不清楚文件会落到本地哪里（与 uploadMenuTitle 对称）。
+    private var downloadMenuTitle: String {
+        guard DownloadDestination.resolve(localDirectory: env.currentLocalDirectory) != nil else {
+            return "下载到本地"
+        }
+        return "下载到 \(Self.displayPath(env.currentLocalDirectory))"
+    }
+
+    /// 家目录显示为 ~，其余显示绝对路径。
+    private static func displayPath(_ url: URL) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = url.path
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
+        return path
+    }
+
     private func downloadSelected(_ entries: [RemoteEntry]) {
         guard let server = env.selectedServer else { return }
-        let localDir = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Downloads")
+        // 目标目录取本地面板当前所在目录。以前这里写死 ~/Downloads，
+        // 既不跟本地面板，也和拖拽下载（落到拖放目标目录）行为不一致。
+        guard let localDir = DownloadDestination.resolve(localDirectory: env.currentLocalDirectory) else {
+            downloadError = "本地目标目录不可用（不存在、不是目录或不可写）：\(Self.displayPath(env.currentLocalDirectory))\n请在左侧本地面板打开一个有效目录后重试"
+            return
+        }
         env.transferQueue.enqueueDownload(
             entries: entries,
             from: server,
@@ -457,18 +504,22 @@ struct RemoteFilePanel: View {
 
     private func deleteEntries(_ entries: [RemoteEntry]) {
         guard let server = env.selectedServer else { return }
-        for e in entries {
-            Task {
+        // 逐个串行删除并收集失败原因：原先每项各起一个 Task 且吞掉错误，
+        // 既拿不到失败信息，也会并发触发多次 reload。
+        Task { @MainActor in
+            var failures: [String] = []
+            for e in entries {
                 do {
                     try await env.remoteFiles.remove(server, path: e.path, recursive: e.isDir)
-                } catch {
-                    // 忽略，最后刷新
-                }
-                await MainActor.run {
                     vm.selection.remove(e.path)
-                    reload()
+                } catch {
+                    failures.append("\(e.name)：\(AppEnvironment.describe(error))")
                 }
             }
+            if !failures.isEmpty {
+                deleteError = failures.joined(separator: "\n")
+            }
+            reload()
         }
     }
 

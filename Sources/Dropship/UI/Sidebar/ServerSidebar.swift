@@ -11,8 +11,7 @@ struct ServerSidebar: View {
     @ObservedObject private var tunnels: TunnelService
     @State private var editingServer: ServerConfig?
     @State private var showingAddSheet = false
-    @State private var importCandidates: [ServerConfig]?
-    @State private var showImportSheet = false
+    @State private var importCandidates: ImportCandidates?
 
     init(store: ServerStore, tunnels: TunnelService) {
         self.store = store
@@ -51,11 +50,12 @@ struct ServerSidebar: View {
                 store.update(updated)
             }
         }
-        .sheet(isPresented: $showImportSheet) {
-            if let candidates = importCandidates {
-                ImportSSHConfigSheet(candidates: candidates) { chosen in
-                    for c in chosen { store.add(c) }
-                }
+        // 必须用 sheet(item:)：候选列表和展示开关如果分成两个 @State 在同一次
+        // 事件里先后赋值，SwiftUI 可能拿着 candidates 仍为 nil 的那版视图去弹窗，
+        // 内容退化成 EmptyView，界面上就是一个空的灰色圆角块。
+        .sheet(item: $importCandidates) { candidates in
+            ImportSSHConfigSheet(candidates: candidates.servers) { chosen in
+                for c in chosen { store.add(c) }
             }
         }
     }
@@ -152,8 +152,9 @@ struct ServerSidebar: View {
             Divider()
             HStack(spacing: 8) {
                 Button {
-                    importCandidates = (try? store.parseSSHConfig()) ?? []
-                    showImportSheet = true
+                    importCandidates = ImportCandidates(
+                        servers: (try? store.parseSSHConfig()) ?? []
+                    )
                 } label: {
                     Label("从 SSH 导入", systemImage: "square.and.arrow.down")
                         .frame(maxWidth: .infinity)
@@ -174,6 +175,12 @@ struct ServerSidebar: View {
         }
         .background(.regularMaterial)
     }
+}
+
+/// sheet(item:) 需要 Identifiable，`[ServerConfig]` 本身不是，包一层。
+private struct ImportCandidates: Identifiable {
+    let id = UUID()
+    let servers: [ServerConfig]
 }
 
 // MARK: - 单行服务器
@@ -249,6 +256,7 @@ private struct ServerRow: View {
                 .font(.caption2)
                 .foregroundStyle(Color.red)
                 .lineLimit(2)
+                .help(message)
         }
     }
 
@@ -293,6 +301,7 @@ private struct ServerRow: View {
                 .font(.caption)
                 .foregroundStyle(Color.red)
                 .lineLimit(1)
+                .help(msg)
         }
     }
 }

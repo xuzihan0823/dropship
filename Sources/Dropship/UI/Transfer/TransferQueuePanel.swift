@@ -48,6 +48,12 @@ struct TransferQueuePanel: View {
         } message: {
             Text(inboxLocationError ?? "未知错误")
         }
+        .sheet(item: Binding(
+            get: { queue.pendingConflicts.first },
+            set: { _ in }
+        )) { conflict in
+            TransferConflictSheet(queue: queue, conflict: conflict)
+        }
     }
 
     // MARK: - 顶部工具栏
@@ -221,6 +227,12 @@ struct TransferQueuePanel: View {
             } label: {
                 Label("取消", systemImage: "xmark")
             }
+        case .awaitingDecision:
+            Button(role: .destructive) {
+                queue.cancelConflict(task.id)
+            } label: {
+                Label("取消", systemImage: "xmark")
+            }
         case .failed:
             Button {
                 queue.retry(task.id)
@@ -328,6 +340,74 @@ struct TransferQueuePanel: View {
 
 }
 
+private struct TransferConflictSheet: View {
+    @ObservedObject var queue: TransferQueue
+    let conflict: PendingTransferConflict
+    @State private var applyToAll = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "doc.on.doc")
+                    .font(.title)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("目标中已有同名文件")
+                        .font(.headline)
+                    Text(conflict.filename)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                detailRow("目标位置", conflict.destinationPath)
+                detailRow("要传输的文件", Formatters.fileSize(conflict.sourceBytes))
+                detailRow("已有文件", conflict.destinationBytes.map(Formatters.fileSize) ?? "大小未知")
+            }
+
+            Text("“覆盖”会替换已有文件；“重命名”会保留两者，并使用类似 name-1.ext 的新名称。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle("应用于全部同名文件", isOn: $applyToAll)
+
+            HStack {
+                Button("取消", role: .cancel) {
+                    queue.cancelConflict(conflict.taskID)
+                }
+                Spacer()
+                Button("跳过") { decide(.skip) }
+                Button("重命名") { decide(.rename) }
+                Button("覆盖") { decide(.overwrite) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+        .interactiveDismissDisabled()
+    }
+
+    private func detailRow(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(title)
+                .foregroundStyle(.secondary)
+                .frame(width: 100, alignment: .leading)
+            Text(value)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func decide(_ policy: ConflictPolicy) {
+        queue.resolveConflict(conflict.taskID, with: policy, applyToAll: applyToAll)
+    }
+}
+
 // MARK: - 单行收件
 
 private struct InboxRow: View {
@@ -432,6 +512,8 @@ private struct TransferRow: View {
             statusBadge("传输中", color: .accentColor, icon: "arrow.triangle.2.circlepath")
         case .verifying:
             statusBadge("校验中", color: .purple, icon: "checkmark.shield")
+        case .awaitingDecision:
+            statusBadge("等待处理同名文件", color: .orange, icon: "doc.on.doc")
         case .completed:
             statusBadge("已完成", color: .green, icon: "checkmark.circle.fill")
         case .skipped:
@@ -465,7 +547,7 @@ private struct TransferRow: View {
 
     private var showsProgress: Bool {
         switch task.state {
-        case .transferring, .paused, .verifying, .preparing, .failed:
+        case .transferring, .paused, .verifying, .preparing, .awaitingDecision, .failed:
             return task.totalBytes > 0
         case .completed, .skipped:
             return task.totalBytes > 0

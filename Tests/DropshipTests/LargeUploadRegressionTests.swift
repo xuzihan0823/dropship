@@ -30,6 +30,65 @@ final class SSHProcessRunnerRegressionTests: XCTestCase {
         )
     }
 
+    /// 回归：远端进程先退出时，客户端继续往它的 stdin 写会拿到 EPIPE。
+    /// 原先 catch 块把 stderr 收上来又丢掉、直接抛这个底层错误，界面上只剩
+    /// `NSPOSIXErrorDomain Code=32 "Broken pipe"`，而真正的原因（权限、空间等）
+    /// 全部丢失。EPIPE 只是症状，远端说了话就必须以它为准。
+    func testUploadSurfacesRemoteStderrInsteadOfBrokenPipe() async throws {
+        let fixture = try UploadFixture(script: """
+        echo 'mkdir: cannot create directory /root/x: Permission denied' >&2
+        exit 1
+        """)
+        defer { fixture.remove() }
+
+        let runner = SSHProcessRunner(sshExecutableURL: fixture.scriptURL)
+        do {
+            try await runner.streamUpload(
+                server: fixture.server,
+                command: "ignored",
+                source: fixture.sourceURL,
+                offset: 0,
+                cancellation: TransferCancellation(),
+                progress: { _ in }
+            )
+            XCTFail("远端已非零退出，上传必须失败")
+        } catch {
+            guard case CoreProcessError.failed(let status, let stderr) = error else {
+                return XCTFail("应替换为远端失败，实际拿到：\(error)")
+            }
+            XCTAssertEqual(status, 1)
+            XCTAssertTrue(
+                stderr.contains("Permission denied"),
+                "远端 stderr 必须保留，实际：\(stderr)"
+            )
+        }
+    }
+
+    /// 远端什么都没说时（纯本地读写失败、或被我们自己 terminate），
+    /// 保留原始错误比换成一个空 stderr 的 failed 更有信息量。
+    func testUploadKeepsOriginalErrorWhenRemoteSaidNothing() async throws {
+        let fixture = try UploadFixture(script: "exit 23")
+        defer { fixture.remove() }
+
+        let runner = SSHProcessRunner(sshExecutableURL: fixture.scriptURL)
+        do {
+            try await runner.streamUpload(
+                server: fixture.server,
+                command: "ignored",
+                source: fixture.sourceURL,
+                offset: 0,
+                cancellation: TransferCancellation(),
+                progress: { _ in }
+            )
+            XCTFail("远端已非零退出，上传必须失败")
+        } catch {
+            XCTAssertFalse(error is CancellationError)
+            if case CoreProcessError.failed(_, let stderr) = error {
+                XCTAssertTrue(stderr.isEmpty, "stderr 为空时不该伪造 failed 内容")
+            }
+        }
+    }
+
     func testUploadTurnsEarlyChildExitIntoErrorInsteadOfTerminatingApp() async throws {
         let fixture = try UploadFixture(script: "exit 23")
         defer { fixture.remove() }
@@ -653,5 +712,31 @@ private final class BurstProgressTransport: TransportStub, @unchecked Sendable {
         for bytes in 1...500 { progress(Int64(bytes)) }
         try await Task.sleep(nanoseconds: 350_000_000)
         for bytes in 501...1_000 { progress(Int64(bytes)) }
+    }
+}
+
+/// 回归：本地面板「上传到远程」早期写死 `/root`，非 root 账号会把文件
+/// 传到没有权限、也不是用户想要的位置。目标目录必须来自远程面板当前目录，
+/// 拿不到时宁可不传也不能回退到任何硬编码路径。
+final class UploadDestinationTests: XCTestCase {
+    func testUsesCurrentRemoteDirectory() {
+        XCTAssertEqual(
+            UploadDestination.resolve(remotePath: "/home/claude/projects"),
+            "/home/claude/projects"
+        )
+    }
+
+    func testRejectsEmptyPathInsteadOfFallingBackToRoot() {
+        XCTAssertNil(UploadDestination.resolve(remotePath: ""))
+        XCTAssertNil(UploadDestination.resolve(remotePath: "   "))
+    }
+
+    func testRejectsRelativePath() {
+        XCTAssertNil(UploadDestination.resolve(remotePath: "projects"))
+        XCTAssertNil(UploadDestination.resolve(remotePath: "~/projects"))
+    }
+
+    func testTrimsSurroundingWhitespace() {
+        XCTAssertEqual(UploadDestination.resolve(remotePath: "  /var/log  "), "/var/log")
     }
 }

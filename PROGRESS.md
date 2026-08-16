@@ -56,6 +56,19 @@ ssh <host> '~/.local/share/dropship/agent --version'
 
 ## 质量记录
 
+### 本地文件右键打开与双击打开修复（2026-08-16）
+
+本地文件表在改用 `TableRow` 原生拖放时删掉了旧的双击手势，但 `onOpen` 没有迁移到
+新的主动作入口；同时 `LocalFileViewModel.openEntry` 只处理目录，右键菜单也把“打开”
+限制为仅目录可用，因此普通文件只能看到上传相关操作，无法按 macOS 习惯直接打开。
+
+现改用 `Table.contextMenu(forSelectionType:primaryAction:)` 统一承接系统原生右键选择与
+双击主动作，不在单元格上叠加手势，避免干扰现有 `TableRow` 拖放。单个本地条目的菜单
+首项会明确显示“打开文件”或“打开文件夹”：目录仍在左侧面板内导航，普通文件通过
+`NSWorkspace` 交给默认应用打开。新增 4 项回归测试；完整 `swift test` 76/76 通过，
+`script/build_and_run.sh --verify` 已完成构建、签名和进程启动。实际右键菜单与双击手感
+由用户在运行中的应用内手动验收。
+
 ### 新增：反向收件隧道，服务器可以主动把文件推回 Mac（2026-08-12）
 
 在此之前 Dropship 是单向发起的：Mac 主动 ssh 出去，服务器没有任何办法把文件送回来。
@@ -125,6 +138,285 @@ Mac 本机验证（2026-08-13）：`swift test` 共 30 项通过，`go test ./..
 移入废纸篓模拟用户删除；服务器执行 `dropship-send` 后，同一路径及 `.incoming` 自动
 重建，76 字节测试文件成功落地，远端与本地 SHA-256 一致。验证后已恢复正式路径
 `~/Downloads/Dropship`，测试目录与产物均移入废纸篓。
+
+### 右键下载目录写死修复（2026-08-15）
+
+`RemoteFilePanel.downloadSelected` 把目标目录写死成 `~/Downloads`，右键「下载到本地」
+既不跟随本地面板当前目录，也和拖拽下载（落到拖放目标目录）行为不一致——同一个应用里
+两条下载路径去向不同，用户无从预期文件落在哪。这与之前修掉的「上传到远程写死 `/root`」
+是同一类问题，解法也对称：
+
+- `AppEnvironment` 新增 `currentLocalDirectory`，由 `LocalFilePanel` 写入、`RemoteFilePanel` 读取，
+  与既有的 `currentRemotePath` 构成一对
+- 新增纯函数 `DownloadDestination.resolve(localDirectory:fileManager:)`，校验存在、是目录、可写；
+  不合法返回 nil，**绝不回退到任何硬编码路径**，规则由 `DownloadDestinationTests` 4 项钉住
+  （含一条专门断言解析结果不会变成 `~/Downloads`）
+- 目标不可用时弹「下载失败」并写出具体路径与补救指引，不静默失败
+- 右键菜单文案与 `uploadMenuTitle` 对称，显示「下载到 ~/Desktop/foo」，点之前就知道去向
+
+附带一处编译必需的重构：加到第 4 个同形错误弹窗后 `body` 触发
+"unable to type-check this expression in reasonable time"，遂把 folderError / moveError /
+deleteError / downloadError 四个弹窗抽成 `View.errorAlert(title:message:)`，构造逐字等价。
+
+`swift test` 72 项通过（基线 68 + 4）。
+
+### 远程拖到本地即下载（2026-08-15）
+
+从远程面板拖文件到本地面板本该是"下载"，但这条路径从没实现。`LocalFilePanel` 的两个投放
+回调直接走 `handleMoveInto`（本地 `FileManager.moveItem`），完全不识别远程载荷。远程面板拖出的
+是应用内部 URL `dropship-remote://move?payload=...`，它的 `lastPathComponent` 拼到目标目录上
+正好等于目标目录本身，于是被判成"同名已存在"——用户看到的就是一句莫名其妙的
+「目标目录中已存在同名项」。
+
+反方向（本地拖到远程）早就是对的：`RemoteFilePanel.handleDrop` 会先把 URL 分成本地文件和
+远程载荷两类再分派。本地面板缺的就是这一层。
+
+补齐：
+- 新增 `LocalFileDropPayloads.classify(_:)` 纯函数做分流，本地 URL 保持原 move 行为
+- 新增 `RemoteDownloadPlan`（与 `RemoteFileMovePlan` 同文件、同范式）：校验载荷 `serverID`
+  与当前选中服务器一致，**跨服务器拒绝**；校验路径形状；给出源路径与目标本地路径
+- `handleDownload` 逐个 `remoteFiles.stat` 构造真实 `RemoteEntry` 后
+  `enqueueDownload(policy: .ask)`，冲突自动走上一节的询问对话框；失败写 `actionError`
+
+`swift test` 68 项通过（基线 64 + 4：混合分类、空白处落当前目录、目录行落该行路径、跨服务器拒绝）。
+
+### 同名文件冲突询问对话框（2026-08-15）
+
+传同名文件直接失败报 `Destination already exists`。根因是 `TransferQueue.resolveConflict` 的
+`.ask` 分支**直接抛 EEXIST**——"询问用户"没有询问任何人。而所有入队点传的都是 `.ask`，
+`docs/PROTOCOL.md` §4 也写着"EEXIST → 询问覆盖"。**这个对话框从来没被实现过**，
+后果是用户永远无法通过拖拽覆盖已有文件。`.overwrite`/`.skip`/`.rename` 三种策略本身
+早已实现（含 `renamedRemoteTask` 生成 `name-1.ext`），只是没有入口能选到。
+
+补齐方式：
+- `TransferState` 新增 `.awaitingDecision`；新增 `PendingTransferConflict`
+  （taskID、文件名、目标路径、方向、双方字节数），对话框据此让用户判断该不该覆盖
+- `TransferQueue` 新增 `@Published pendingConflicts` 与 `sessionConflictPolicy`；
+  `.ask` 命中冲突时登记并置为 `.awaitingDecision`
+- 新增 `resolveConflict(_:with:applyToAll:)` 与 `cancelConflict(_:)`
+- `TransferQueuePanel` 增加冲突 sheet：覆盖 / 跳过 / 重命名 / 取消 + 「应用于全部」
+
+**防死锁是这次的核心风险**，机制是：任务置为 `.awaitingDecision` 后立刻 `completeJob`
+**释放并发槽**，其余任务照常执行；用户决定后把状态置回 `.queued`，`updateTask` 会自动
+`enqueuePending` 重新入队并 `startPending()`。会话级策略在队列真正清空时清除
+（jobs 空 + pending 空 + 无待决冲突 + 无排队任务，四个条件同时满足）。
+
+回归测试 `TransferConflictTests` 6 项。其中防死锁那条设计得比要求更严：把
+`maxConcurrent` 设为 1（只有一个槽），断言冲突任务卡在 `.awaitingDecision` 期间另一个
+无冲突任务能跑完——若 parked 任务占着槽不放，该测试会直接超时。
+
+`swift test` 64 项通过（基线 58 + 6）。
+
+### Broken pipe 盖住真实传输错误修复（2026-08-15）
+
+现象：拖一个 12.8MB 文件上传，进度 0 bytes 就失败，界面只显示
+`NSCocoaErrorDomain Code=512 ... NSPOSIXErrorDomain Code=32 "Broken pipe"`，看不出任何原因。
+
+EPIPE 在上传里只是**症状**：远端进程先退出了，客户端才写不进它的 stdin。真正的原因写在远端
+stderr 里。而 `SSHProcess.streamUpload` / `streamDownload` 的 catch 块把 stderr 收上来之后
+**直接丢弃**、抛出原始的底层写错误：
+
+```swift
+_ = errorCollector.waitForData()   // 收了，然后扔掉
+throw error                        // 抛 EPIPE，远端说的话没了
+```
+
+于是 `Permission denied`、`No space left` 这类关键信息全部丢失。这与之前 `CoreProcessError`
+不实现 `LocalizedError` 是同一类问题：错误信息没能走到界面上。
+
+改为新增 `preferRemoteFailure(_:process:stderr:cancellation:)`：远端非零退出**且 stderr 非空**时，
+以 `CoreProcessError.failed(status, stderr)` 取代底层错误；被我们自己 terminate、或纯本地读写
+失败时 stderr 为空，保留原始错误更有信息量；取消语义优先级最高，不受影响。上传下载两条路径同改。
+
+新增两项回归测试：远端 `echo ... >&2; exit 1` 时断言拿到的是含 `Permission denied` 的
+`CoreProcessError.failed` 而非 EPIPE；远端静默 `exit 23` 时断言不伪造 stderr 内容。
+原有的 `testUploadTurnsEarlyChildExitIntoErrorInsteadOfTerminatingApp` 只断言了"不是取消错误"，
+没覆盖 stderr 是否幸存，正是这次的缺口。
+
+`swift test` 58 项通过（基线 56 + 2）。
+
+### agent 自动部署的开关与披露（2026-08-15）
+
+开源发布前的信任底线：应用连接服务器时会自动上传 Go agent 二进制并执行，用户必须能拒绝，
+且界面上要说清楚。产品决策为**按服务器独立开关、默认开启、不做首次连接弹窗**。
+
+- `ServerConfig` 新增 `allowAgentDeploy: Bool = true`
+- `RemoteFileServiceImpl.connect` 在 `do` 块**之前** guard：关闭时 `bootstrapper.ensure` 与
+  `agent.connect` 一次都不调用，直接走 SFTP。关键是"关了就绝不往服务器写任何东西"，
+  而不是"失败后降级"
+- `ServerFormSheet` 增加开关与说明，写明上传什么（版本引用 `Bootstrapper.agentVersion`，
+  非硬编码）、传到哪（`$HOME/.local/share/dropship/agent`，0755）、会被执行、关闭后
+  SFTP 降级没有哈希校验、改完需断开重连
+
+**踩中前主动规避的坑**：`ServerConfig` 是 `Codable` 且已存档在 `servers.json`。Swift 合成的
+`Decodable` **不会**在 key 缺失时使用属性默认值，直接加字段会让现有存档全部解码失败、
+用户已保存的服务器全丢。改为自定义 `init(from:)`，新字段 `decodeIfPresent ?? true`，
+3 个 Optional 字段保持可选语义，`favorites` 缺失兼容 `[]`。
+
+另一个坑：`ServerFormSheet` 的 `isEditingSSHSourced` 会禁用 ssh config 派生字段。这个开关是
+应用自身的信任设置，**不能**被它禁用，否则从 ssh config 导入的服务器根本改不了。已确认
+该属性只作用于第 50 行的字段组，新 Section 不受影响。
+
+依赖注入：只给 `Bootstrapper` 加了 `BootstrapperProviding` 协议（conformance 用空 extension
+写在 `Transports.swift`，不碰 `Bootstrapper.swift`）；`agent`/`sftp` 本来就符合 `FileTransport`，
+只把属性类型放宽即可，不引入语义重叠的新抽象。
+
+验证：`swift build` 无 warning；`swift test` 56 项通过（基线 53 + 3）；独立读取用户真实
+`servers.json`（655 字节、不含新字段的老格式）解码成功，2 台服务器均得到 `allowAgentDeploy=true`，
+`identityFile` 保持正确，文件 mtime 未变。
+
+### SFTP 降级上传的续传错位与无校验修复（2026-08-15）
+
+发布前审查发现，降级路径会**静默损坏用户服务器上的文件**。三个叠加缺陷：
+
+**A. 续传偏移错位。** offset 来自 `.dropship-part` 的精确字节数，不是 MiB 对齐的，而旧代码写
+`dd bs=1048576 seek=<offset/1048576>`，整数除法把余数丢了。真机实证：offset=3000000 时
+`seek` 只到 2 MiB(2097152)，5000000 字节的源文件最终产出 **4097152 字节的损坏文件**，
+且 `mv` 照常执行、退出码 0。
+
+**B. 管道短读。** `dd bs=1M` 从管道读时短读极常见，无 `iflag=fullblock` 会写出短块导致错位；
+而 `iflag` 是 GNU dd 专有，这条路径恰恰服务于非 GNU 系统，不能用。
+
+**C. 传完不校验就 rename。** SSH 断线让 stdin 提前 EOF，`cat`/`dd` 正常退出，`mv -f` 直接把
+半截文件盖到原文件上——正是 `docs/PROTOCOL.md` §2.2 记录过的事故，agent 路径靠
+`--expect-size` 防住了，降级路径完全没有。
+
+改法（全部 POSIX 可移植，不含 GNU 专有选项）：`.part` 先用
+`dd if=/dev/null of=<part> bs=1 seek=<精确 offset>` 截断到精确字节，再 `cat >>` 追加——
+`>>` 每次写都定位到文件末尾，天然没有块对齐问题，同时解决 A 和 B。传完用
+`wc -c` 与本地文件大小比对，不符则 stderr 输出 `ESIZE`、保留 `.part`、非零退出、**绝不 mv**。
+`upload` 补上 `transferError(from:)` 转换（该路径原先没有），使 `ESIZE` 被识别为可重试而自动续传。
+
+**审查中又发现一处放行漏洞**：校验最初写作 `[ "$size" -ne N ]`。当 `wc -c` 失败（`.part` 被删、
+权限变化、磁盘异常）时 size 为空串，`[` 报 "integer expression expected" 返回 2，`if` 判定为假，
+**校验失败反而放行了 mv**；`set -e` 也抓不到，因为管道退出码取的是末端 `tr` 的 0。已改为字符串
+比较 `[ "$size" != "N" ]`（空串天然不等），并加测试钉死不得退回数值比较。
+
+真机验证（vps，Ubuntu 24.04，5MB 随机文件）：完整传输哈希一致；offset=3000000 非对齐续传
+哈希一致；故意少传时 `exit=1`、stderr `ESIZE: expected 5000000 bytes, got 3001000`、
+`.part` 保留 3001000 字节、**目标文件内容仍为原样未被覆盖**。同时用旧写法复现了 A 的损坏结果作为对照。
+
+新增 `SFTPUploadCommandTests`(4) 与 `SFTPUploadSizeGuardTests`(2)，`swift test` 共 53 项通过。
+
+### 列目录跨平台兼容（2026-08-15）
+
+SFTP 降级路径原先固定发 `find -printf`，那是 GNU findutils 专有选项。macOS 实测
+`find: -printf: unknown primary or operator`，BSD/FreeBSD 与部分精简系统同理，
+**在这些系统上列目录会直接失败**。注意 agent 协议本身有原生 `list`，所以这条只影响
+agent 跑不起来时的兜底——而那恰恰最可能是非常规系统。
+
+改为连接后探测一次方言并按服务器缓存（断开时清除）：
+
+| 方言 | 命令 | 覆盖 |
+| --- | --- | --- |
+| `gnuFind` | `find -printf`，一次调用拿全字段 | 绝大多数 Linux |
+| `gnuStat` | `find -exec stat -c {} +` | busybox 等无 `find -printf` 的系统 |
+| `bsdStat` | `find -exec stat -f {} +` | macOS / FreeBSD |
+
+两种 stat 方言统一输出同样的 7 字段记录，共用一个解析器。BSD 用 `%Mp%Lp` 而不是 `%Op`，
+只取 setuid 位和权限位，与 GNU 的 `%a` 对齐（`%Op` 会带上文件类型位，变成 `100644`）。
+分隔符用 US(0x1F)：文件名可以含换行和 `|`，而 BSD stat 没有 NUL 输出选项。记录间的
+换行是 stat 自己补的，解析时只剥掉首字段的一个前导换行，文件名内部的换行得以保留。
+三种方言都探测不到时抛出明确错误，而不是让命令以看不懂的方式失败。
+
+真机验证：探测判定 macOS 26 → `bsdStat`，vps / aliyun01 / tokyo-server（Ubuntu 24.04，
+GNU findutils 4.9.0）→ `gnuFind`。BSD 命令在本机实跑，输出结构与解析器逐字段对齐。
+新增 `RemoteListingCompatTests` 6 项（含空格文件名、换行文件名、BSD 类型描述大小写、
+空目录、隐藏文件过滤与目录优先排序），`swift test` 共 47 项通过。
+
+### 上传目标写死与静默吞错修复（2026-08-15）
+
+发布前排查发现的两类会真正伤到用户的缺陷。
+
+**一、右键「上传到远程」写死 `/root`**
+
+`LocalFilePanel.uploadToRemote` 原先固定 `remoteDir: "/root"`（注释自己写着"简化路径"）。
+非 root 账号（`tencent-claude`、aliyun02 的 `ankangxu`）会把文件传到没有权限、
+也不是用户想要的位置，且没有任何提示。
+
+改为取远程面板当前目录：`AppEnvironment` 新增 `currentRemotePath`，由 `RemoteFilePanel`
+在 `onChange(of: vm.path)` 写入，断开连接时自动清空。解析逻辑抽成纯函数
+`UploadDestination.resolve(remotePath:)`，拒绝空串与相对路径——**拿不到目标目录时宁可不传，
+也不回退到任何硬编码路径**，这条规则由 `UploadDestinationTests` 4 项测试钉住。
+菜单项同时改为显示实际目标（「上传到 /home/claude/projects」）并在不可用时置灰，
+让用户点之前就知道文件会落到哪。
+
+**二、失败被静默吞掉**
+
+以下位置原先直接丢弃错误，用户只会觉得"点了没反应"：
+
+| 位置 | 原写法 |
+| --- | --- |
+| `RemoteFilePanel.deleteEntries` | `catch { // 忽略，最后刷新 }` |
+| `LocalFilePanel.handleMoveInto` | `catch { // 失败忽略 }`，同名文件也静默跳过 |
+| `LocalFilePanel.deleteEntries` | `try? fm.removeItem` |
+| `LocalFilePanel.createFolder` | `try? createDirectory` |
+
+现统一改为逐项收集失败原因、一次性弹窗提示，避免多选操作弹出一连串弹窗。远程删除
+顺带从"每项各起一个 Task"改成串行，原写法既拿不到失败信息，也会并发触发多次 reload。
+
+`swift build`、`swift test`（41 项）、`./scripts/build-app.sh` 通过。
+
+### SSH 导入弹窗首次打开空白修复（2026-08-14）
+
+现象：点「从 SSH 导入」，第一次弹出的是一个空的灰色圆角块；按 ESC 关掉再点一次就正常。
+
+原因是候选列表和展示开关拆成了两个 `@State`：
+
+```swift
+@State private var importCandidates: [ServerConfig]?
+@State private var showImportSheet = false
+// 按钮里同一次事件先后赋值
+importCandidates = (try? store.parseSSHConfig()) ?? []
+showImportSheet = true
+// sheet 内部再 if let 解包
+.sheet(isPresented: $showImportSheet) { if let candidates = importCandidates { ... } }
+```
+
+SwiftUI 可能拿着 `importCandidates` 仍为 nil 的那一版视图去构建 sheet 内容，`if let` 落空、
+内容退化成 `EmptyView`，弹窗就被压成一个没有内容的小方块。第二次点击时上一轮的候选值还在，
+解包成功，所以"重开就好"。
+
+改为 `sheet(item:)` 由数据本身驱动展示，内容一定拿得到值。`[ServerConfig]` 不是 `Identifiable`，
+用 `ImportCandidates` 包一层。同文件里编辑服务器的 sheet 本来就是 `sheet(item:)`，不受影响。
+
+`swift build` 与 `swift test`（37 项）通过。
+
+### 连接失败报错被吞掉修复（2026-08-14）
+
+侧边栏连接失败只显示 `The operation couldn't be completed. (Dropship.CoreProcessError error 2.)`，
+真正的 ssh stderr 明明已经带在 `CoreProcessError.failed(status, stderr)` 的 payload 里却看不到。
+原因是 `CoreProcessError` 只是裸 `enum: Error`，而 `AppEnvironment.describe` 只解包 `TransferError`，
+其余一律落到 Foundation 的兜底 `localizedDescription`。
+
+现让 `CoreProcessError` 实现 `LocalizedError`，`.failed` 直接输出 ssh stderr（多行压成一句、
+去掉 `Warning: Permanently added` 一类噪声行）。侧边栏连接失败与隧道失败的红字都补了 `.help()`，
+悬停可看完整报错——一行文本必然截断。`String(describing:)` 行为未变，`transferError(from:)`
+的错误码识别不受影响。
+
+实战验证：该修复上线前，一台服务器连不上只显示兜底文案；手工执行 ssh 才拿到真实原因
+`kex_exchange_identification: Connection closed by remote host`。
+
+### 文件表投放死区修复（2026-08-13）
+
+现象：拖到服务器面板列表中下部大片空白处不触发传输，只有贴近列头那条窄带才判定成功。
+
+根因是 `Table` 由 `NSTableView` 支撑，而 08-12 那次只给**目录行**注册了
+`TableRow.dropDestination`。NSTableView 对文件行和最后一行下方的空白区一律返回
+`NSDragOperationNone`，且不会把事件上交给挂在 `Table` 上的 `.onDrop`；只有列头
+（`NSTableHeaderView` 不接管拖拽）能落到 SwiftUI，于是形成"只有顶部一条能投"的表现。
+
+三层补齐，且不回退目录行精准命中：
+1. 所有行都注册 `dropDestination`——目录行落进该目录，文件行落到当前目录，消除行级死区。
+2. 新增 `TableContentBottomReader` 探针：从窗口视图树里按几何重叠度锁定本面板的
+   `NSTableView`，量出最后一行底边，只在**其下方**铺一层 SwiftUI 投放区。因为不覆盖行区，
+   不会像 08-12 之前的面板级 `.onDrop` 那样抢走 `TableRow` 的目标。探针失效时退回
+   28pt 行高估算，宁可少覆盖也不盖住目录行。
+3. 空目录占位视图（`ContentUnavailableView`）此前完全无法投放，现由通用
+   `fileDropCatcher` 修饰器接管，两侧面板一致。
+
+`swift build`、`swift test`（37 项通过）、`./scripts/build-app.sh` 均通过。Finder 实机拖拽
+按项目惯例留给用户执行，已开 `log stream` 监听 `category == "drag-drop"` 便于定位。
 
 ### 非 root 账号远程目录加载修复（2026-08-13）
 

@@ -69,6 +69,64 @@ private extension Data {
     }
 }
 
+struct RemoteDownloadPlan: Equatable {
+    let sourcePath: String
+    let targetLocalURL: URL
+
+    var localDirectory: URL {
+        targetLocalURL.deletingLastPathComponent()
+    }
+
+    static func make(
+        payload: RemoteFileDragPayload,
+        targetDirectory: URL,
+        selectedServerID: UUID
+    ) throws -> RemoteDownloadPlan {
+        guard payload.serverID == selectedServerID else {
+            throw RemoteDownloadPlanError.differentServer
+        }
+
+        let source = (payload.path as NSString).standardizingPath
+        let filename = (source as NSString).lastPathComponent
+        guard source.hasPrefix("/"), !filename.isEmpty, filename == payload.name,
+              targetDirectory.isFileURL else {
+            throw RemoteDownloadPlanError.invalidPayload
+        }
+
+        let directory = targetDirectory.standardizedFileURL
+        return RemoteDownloadPlan(
+            sourcePath: source,
+            targetLocalURL: directory.appendingPathComponent(filename)
+        )
+    }
+}
+
+enum RemoteDownloadPlanError: LocalizedError, Equatable {
+    case differentServer
+    case invalidPayload
+
+    var errorDescription: String? {
+        switch self {
+        case .differentServer:
+            return "不能从另一台服务器下载文件，请先切换到对应服务器"
+        case .invalidPayload:
+            return "拖拽的服务器文件信息无效"
+        }
+    }
+}
+
+struct LocalFileDropPayloads: Equatable {
+    let localURLs: [URL]
+    let remotePayloads: [RemoteFileDragPayload]
+
+    static func classify(_ urls: [URL]) -> LocalFileDropPayloads {
+        LocalFileDropPayloads(
+            localURLs: urls.filter(\.isFileURL),
+            remotePayloads: urls.compactMap(RemoteFileDragPayload.init(dragURL:))
+        )
+    }
+}
+
 struct RemoteFileMovePlan: Equatable {
     let sourcePath: String
     let targetPath: String

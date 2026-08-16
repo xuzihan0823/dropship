@@ -16,6 +16,40 @@ enum CoreProcessError: Error {
     case cancelled
 }
 
+/// 没有这层实现时，连接失败会一路走到 `error.localizedDescription`，界面上只剩
+/// "The operation couldn't be completed. (Dropship.CoreProcessError error 2.)"，
+/// 真正的 ssh stderr 明明已经带在 payload 里却看不到。
+extension CoreProcessError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .launch(let message):
+            return "无法启动 ssh：\(message)"
+        case .timedOut:
+            return "ssh 命令超时"
+        case .cancelled:
+            return "操作已取消"
+        case .failed(let status, let stderr):
+            let detail = Self.condense(stderr)
+            return detail.isEmpty ? "ssh 以退出码 \(status) 结束" : detail
+        }
+    }
+
+    /// ssh 的 stderr 常是多行且带 \r，侧边栏只有一行，压成一句并去掉噪声行。
+    private static func condense(_ stderr: String) -> String {
+        let noise = [
+            "Warning: Permanently added",
+            "Pseudo-terminal will not be allocated",
+        ]
+        return stderr
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                !line.isEmpty && !noise.contains(where: line.hasPrefix)
+            }
+            .joined(separator: " · ")
+    }
+}
+
 /// Continuously drains a child-process pipe so verbose progress output cannot
 /// fill the kernel buffer and deadlock the transfer. Only a bounded tail is
 /// retained because callers need the final protocol error, not every progress
@@ -217,8 +251,13 @@ final class SSHProcessRunner: @unchecked Sendable {
                 if started.process.isRunning { started.process.terminate() }
                 started.process.waitUntilExit()
                 _ = outputCollector.waitForData()
-                _ = errorCollector.waitForData()
-                throw error
+                let errors = errorCollector.waitForData()
+                throw Self.preferRemoteFailure(
+                    error,
+                    process: started.process,
+                    stderr: errors,
+                    cancellation: cancellation
+                )
             }
         }.value
     }
@@ -253,10 +292,36 @@ final class SSHProcessRunner: @unchecked Sendable {
             } catch {
                 if started.process.isRunning { started.process.terminate() }
                 started.process.waitUntilExit()
-                _ = errorCollector.waitForData()
-                throw error
+                let errors = errorCollector.waitForData()
+                throw Self.preferRemoteFailure(
+                    error,
+                    process: started.process,
+                    stderr: errors,
+                    cancellation: cancellation
+                )
             }
         }.value
+    }
+
+    /// 读写管道失败（典型是 EPIPE "Broken pipe"）只是**症状**：远端进程先退出了，
+    /// 客户端才写不进去。真正的原因写在它的 stderr 里。原先直接抛这个底层 POSIX
+    /// 错误，界面上只剩一句 `NSPOSIXErrorDomain Code=32 "Broken pipe"`，
+    /// `Permission denied`、`No space left` 这类关键信息全被丢掉。
+    ///
+    /// 只在远端**确实说了话**时才替换：被我们自己 terminate 掉、或纯本地文件
+    /// 读写失败的场景 stderr 为空，那时保留原始错误更有信息量。
+    private static func preferRemoteFailure(
+        _ error: Error,
+        process: Process,
+        stderr: Data,
+        cancellation: TransferCancellation
+    ) -> Error {
+        if cancellation.isCancelled { return CoreProcessError.cancelled }
+        if case CoreProcessError.cancelled = error { return error }
+        let text = String(decoding: stderr, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus != 0, !text.isEmpty else { return error }
+        return CoreProcessError.failed(process.terminationStatus, text)
     }
 
     private struct Started { let process: Process; let input: Pipe; let output: Pipe; let error: Pipe }

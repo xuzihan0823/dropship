@@ -22,6 +22,7 @@ struct ServerFormSheet: View {
     @State private var identityFile: String = ""
     @State private var proxyJump: String = ""
     @State private var defaultRemotePath: String = ""
+    @State private var allowAgentDeploy = true
     @State private var showValidationError = false
 
     init(mode: Mode, onSave: @escaping (ServerConfig) -> Void) {
@@ -36,6 +37,7 @@ struct ServerFormSheet: View {
             _identityFile = State(initialValue: s.identityFile ?? "")
             _proxyJump = State(initialValue: s.proxyJump ?? "")
             _defaultRemotePath = State(initialValue: s.defaultRemotePath ?? "")
+            _allowAgentDeploy = State(initialValue: s.allowAgentDeploy)
         }
     }
 
@@ -73,6 +75,13 @@ struct ServerFormSheet: View {
                 Section("默认目录") {
                     TextField("连接后打开的远程目录", text: $defaultRemotePath)
                         .help("留空则使用服务器家目录")
+                }
+                Section("Agent 部署") {
+                    Toggle("允许部署并执行 Dropship agent", isOn: $allowAgentDeploy)
+                    Text("开启后，连接时会将版本 \(Bootstrapper.agentVersion) 的 Dropship agent 二进制上传到 $HOME/.local/share/dropship/agent，设置权限 0755 并执行。关闭后不会上传或执行 agent，而是直接使用 SFTP 降级路径；该路径速度较慢，传输后只有字节数校验，没有哈希校验。修改此设置后需要断开并重新连接才会生效。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if showValidationError {
                     Section {
@@ -155,6 +164,7 @@ struct ServerFormSheet: View {
             server.identityFile = identityFile.isEmpty ? nil : identityFile
             server.proxyJump = proxyJump.isEmpty ? nil : proxyJump
             server.defaultRemotePath = defaultRemotePath.isEmpty ? nil : defaultRemotePath
+            server.allowAgentDeploy = allowAgentDeploy
         } else {
             server = ServerConfig(
                 alias: trimmedAlias,
@@ -165,7 +175,8 @@ struct ServerFormSheet: View {
                 identityFile: identityFile.isEmpty ? nil : identityFile,
                 proxyJump: proxyJump.isEmpty ? nil : proxyJump,
                 source: .manual,
-                defaultRemotePath: defaultRemotePath.isEmpty ? nil : defaultRemotePath
+                defaultRemotePath: defaultRemotePath.isEmpty ? nil : defaultRemotePath,
+                allowAgentDeploy: allowAgentDeploy
             )
         }
         onSave(server)

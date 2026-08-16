@@ -23,6 +23,14 @@ final class AppEnvironment: ObservableObject {
     @Published var showHiddenFiles: Bool = false
     /// 传输队列面板是否展开。
     @Published var transferPanelExpanded: Bool = true
+    /// 远程面板当前所在目录，由 RemoteFilePanel 写入。
+    /// 本地面板的「上传到远程」需要它才能知道该传到哪儿；空串表示远程面板
+    /// 尚未打开任何目录（未选中服务器、未连接或正在加载）。
+    @Published var currentRemotePath: String = ""
+    /// 本地面板当前所在目录，由 LocalFilePanel 写入。
+    /// 远程面板的「下载到本地」需要它才能知道该落到哪儿，避免写死 ~/Downloads；
+    /// 默认值与 LocalFileViewModel.url 的初始值一致。
+    @Published var currentLocalDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
 
     private var cancellables: Set<AnyCancellable> = []
 

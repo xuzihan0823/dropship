@@ -23,6 +23,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     /// A single published revision drives the UI snapshot. All other queue
     /// aggregates are plain stored properties updated before this changes.
     @Published private(set) var snapshotRevision = 0
+    /// Conflicts currently waiting for an explicit user decision.
+    @Published private(set) var pendingConflicts: [PendingTransferConflict] = []
 
     private let visibleTaskLimit = 200
     private var visibleTaskIDs: [UUID] = []
@@ -47,6 +49,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     private let service: FileTransport
     private var servers: [UUID: ServerConfig] = [:]
     private var policies: [UUID: ConflictPolicy] = [:]
+    private var sessionConflictPolicy: ConflictPolicy?
+    private var pendingConflictIDs: Set<UUID> = []
     private var jobs: [UUID: Task<Void, Never>] = [:]
     private var cancellations: [UUID: TransferCancellation] = [:]
     private var speedSamples: [UUID: [(Date, Int64)]] = [:]
@@ -149,6 +153,37 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         }
     }
 
+    /// Resolve one pending conflict and optionally use the choice for the session.
+    func resolveConflict(_ conflictID: UUID, with policy: ConflictPolicy, applyToAll: Bool = false) {
+        guard policy != .ask,
+              let index = taskIndexes[conflictID],
+              tasks[index].state == .awaitingDecision else { return }
+        if applyToAll { sessionConflictPolicy = policy }
+        let ids = applyToAll ? pendingConflictIDs : [conflictID]
+        for id in ids {
+            guard let taskIndex = taskIndexes[id], tasks[taskIndex].state == .awaitingDecision else { continue }
+            policies[id] = policy
+            updateTask(at: taskIndex) { $0.state = .queued }
+            pendingConflictIDs.remove(id)
+        }
+        pendingConflicts.removeAll { !pendingConflictIDs.contains($0.taskID) }
+        requestSnapshot(immediate: true)
+        startPending()
+    }
+
+    /// Cancel one task that is waiting for a conflict decision.
+    func cancelConflict(_ conflictID: UUID) {
+        guard let index = taskIndexes[conflictID], tasks[index].state == .awaitingDecision else { return }
+        pendingConflictIDs.remove(conflictID)
+        pendingConflicts.removeAll { $0.taskID == conflictID }
+        updateTask(at: index) {
+            $0.state = .cancelled
+            $0.finishedAt = Date()
+        }
+        requestSnapshot(immediate: true)
+        startPending()
+    }
+
     func pause(_ taskID: UUID) {
         guard let index = taskIndexes[taskID] else { return }
         cancellations[taskID]?.cancel()
@@ -168,6 +203,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
     func cancel(_ taskID: UUID) {
         cancellations[taskID]?.cancel()
         jobs[taskID]?.cancel()
+        pendingConflictIDs.remove(taskID)
+        pendingConflicts.removeAll { $0.taskID == taskID }
         if let index = taskIndexes[taskID] {
             updateTask(at: index) {
                 $0.state = .cancelled
@@ -187,7 +224,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         let now = Date()
         for index in tasks.indices {
             switch tasks[index].state {
-            case .queued, .preparing, .transferring, .verifying, .paused:
+            case .queued, .preparing, .transferring, .verifying, .awaitingDecision, .paused:
                 updateTask(at: index) {
                     $0.state = .cancelled
                     $0.finishedAt = now
@@ -199,6 +236,9 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         }
         pendingTaskIDs.removeAll(keepingCapacity: true)
         pendingTaskIDSet.removeAll(keepingCapacity: true)
+        pendingConflicts.removeAll(keepingCapacity: true)
+        pendingConflictIDs.removeAll(keepingCapacity: true)
+        sessionConflictPolicy = nil
         pendingCursor = 0
         preparedRemoteDirectories.removeAll(keepingCapacity: true)
         for job in remoteDirectoryJobs.values { job.cancel() }
@@ -244,6 +284,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         tasks.removeAll { removedIDs.contains($0.id) }
         for taskID in removedIDs {
             policies.removeValue(forKey: taskID)
+            pendingConflictIDs.remove(taskID)
+            pendingConflicts.removeAll { $0.taskID == taskID }
             pendingTaskIDSet.remove(taskID)
             visibleTaskIDSet.remove(taskID)
         }
@@ -370,6 +412,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         applyTaskDelta(from: removed, to: nil)
         taskIndexes.removeValue(forKey: removed.id)
         policies.removeValue(forKey: removed.id)
+        pendingConflictIDs.remove(removed.id)
+        pendingConflicts.removeAll { $0.taskID == removed.id }
         pendingTaskIDSet.remove(removed.id)
         visibleTaskIDSet.remove(removed.id)
         visibleTaskIDs.removeAll { $0 == removed.id }
@@ -427,7 +471,7 @@ final class TransferQueue: TransferQueueService, ObservableObject {
 
     private func isCancellable(_ state: TransferState) -> Bool {
         switch state {
-        case .queued, .preparing, .transferring, .verifying, .paused: return true
+        case .queued, .preparing, .transferring, .verifying, .awaitingDecision, .paused: return true
         case .completed, .skipped, .failed, .cancelled: return false
         }
     }
@@ -541,9 +585,16 @@ final class TransferQueue: TransferQueueService, ObservableObject {
             if transfer.direction == .upload {
                 try await ensureRemoteParentDirectory(for: transfer, server: server)
             }
-            let policy = policies[transferID] ?? .ask
+            let configuredPolicy = policies[transferID] ?? .ask
+            let policy = configuredPolicy == .ask
+                ? (sessionConflictPolicy ?? .ask)
+                : configuredPolicy
             transfer = try await resolveConflict(transfer, server: server, policy: policy)
             replaceTask(transfer)
+            guard transfer.state != .awaitingDecision else {
+                completeJob(transferID)
+                return
+            }
             guard transfer.state != .skipped else {
                 finish(transferID, state: .skipped)
                 completeJob(transferID)
@@ -691,7 +742,8 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         }
         guard exists else { return resolved }
 
-        switch policy {
+        let effectivePolicy = policy == .ask ? (sessionConflictPolicy ?? .ask) : policy
+        switch effectivePolicy {
         case .overwrite:
             if task.direction == .download {
                 try? FileManager.default.removeItem(at: task.localURL)
@@ -700,7 +752,23 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         case .skip:
             resolved.state = .skipped
         case .ask:
-            throw TransferError(code: "EEXIST", message: "Destination already exists")
+            let destinationBytes: Int64?
+            if task.direction == .upload {
+                destinationBytes = (try? await service.stat(server, path: task.remotePath))?.size
+            } else {
+                destinationBytes = (try? task.localURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) }
+            }
+            resolved.state = .awaitingDecision
+            if pendingConflictIDs.insert(task.id).inserted {
+                pendingConflicts.append(PendingTransferConflict(
+                    taskID: task.id,
+                    filename: task.filename,
+                    destinationPath: task.direction == .upload ? task.remotePath : task.localURL.path,
+                    direction: task.direction,
+                    sourceBytes: task.totalBytes,
+                    destinationBytes: destinationBytes
+                ))
+            }
         case .rename:
             if task.direction == .upload {
                 resolved = try await renamedRemoteTask(task, server: server)
@@ -719,11 +787,11 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         let path = NSString(string: task.remotePath)
         let directory = path.deletingLastPathComponent
         let extensionName = path.pathExtension
-        let base = path.deletingPathExtension
+        let baseName = NSString(string: path.deletingPathExtension).lastPathComponent
         for suffix in 1...9_999 {
             let filename = extensionName.isEmpty
-                ? "\(base)-\(suffix)"
-                : "\(base)-\(suffix).\(extensionName)"
+                ? "\(baseName)-\(suffix)"
+                : "\(baseName)-\(suffix).\(extensionName)"
             let candidate = Self.joinRemote(directory, filename)
             if (try? await service.stat(server, path: candidate)) == nil {
                 result = TransferTask(
@@ -865,6 +933,10 @@ final class TransferQueue: TransferQueueService, ObservableObject {
         if jobs.isEmpty, pendingTaskIDSet.isEmpty {
             preparedRemoteDirectories.removeAll(keepingCapacity: true)
             remoteDirectoryJobs.removeAll(keepingCapacity: true)
+            if pendingConflictIDs.isEmpty, activeEnqueueIDs.isEmpty,
+               !tasks.contains(where: { $0.state == .queued }) {
+                sessionConflictPolicy = nil
+            }
         }
     }
 

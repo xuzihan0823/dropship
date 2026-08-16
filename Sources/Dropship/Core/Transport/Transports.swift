@@ -340,17 +340,23 @@ final class AgentTransport: FileTransport {
     }
 }
 
+protocol BootstrapperProviding {
+    func ensure(_ server: ServerConfig) async throws -> TransportMode
+}
+
+extension Bootstrapper: BootstrapperProviding {}
+
 final class RemoteFileServiceImpl: FileTransport {
-    private let sftp: SFTPTransport
-    private let agent: AgentTransport
-    private let bootstrapper: Bootstrapper
+    private let sftp: any FileTransport
+    private let agent: any FileTransport
+    private let bootstrapper: any BootstrapperProviding
     private let lock = NSLock()
     private var modes: [UUID: TransportMode] = [:]
 
     init(
-        sftp: SFTPTransport = SFTPTransport(),
-        agent: AgentTransport = AgentTransport(),
-        bootstrapper: Bootstrapper = Bootstrapper()
+        sftp: any FileTransport = SFTPTransport(),
+        agent: any FileTransport = AgentTransport(),
+        bootstrapper: any BootstrapperProviding = Bootstrapper()
     ) {
         self.sftp = sftp
         self.agent = agent
@@ -358,6 +364,12 @@ final class RemoteFileServiceImpl: FileTransport {
     }
 
     func connect(_ server: ServerConfig) async throws -> TransportMode {
+        guard server.allowAgentDeploy else {
+            _ = try await sftp.connect(server)
+            setMode(.sftp, for: server.id)
+            return .sftp
+        }
+
         do {
             _ = try await bootstrapper.ensure(server)
             let mode = try await agent.connect(server)
