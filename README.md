@@ -1,23 +1,46 @@
 # Dropship
 
-Mac 与 Linux 服务器之间的拖拽式文件互传工具。macOS 原生 SwiftUI 应用，左边本地目录、右边服务器目录，拖过去就传。
+Mac 与 Linux 服务器之间的拖拽式文件互传工具。Dropship 使用原生 SwiftUI 构建：左侧浏览
+Mac 文件，右侧浏览服务器文件，拖过去即可传输。
 
-底层只依赖 `ssh`——不需要在服务器上装守护进程、开额外端口或改防火墙。
+本地只依赖系统自带的 `ssh`，无需开放额外公网端口或修改服务器防火墙。
 
-**当前版本 0.2.0，要求 macOS 14+。**
+**当前版本：0.2.0 · macOS 14+ · Apple Silicon**
 
----
+![Dropship 主界面](./image.png)
+
+## 核心能力
+
+- Mac 与服务器之间双向拖拽文件和目录
+- 精准投放到指定目录，空白区域则使用当前目录
+- 本地文件支持右键打开和双击打开
+- 同名文件支持覆盖、跳过、自动重命名和应用到全部
+- 大文件断点续传、传输进度、批量停止和完成记录清理
+- 服务器可通过反向收件隧道主动向 Mac 推送文件
+- 默认 Agent 模式，并提供无需部署二进制的 SFTP 降级模式
 
 ## 安装
 
-### 使用 DMG 安装（推荐）
+### 使用 DMG（推荐）
 
-从 [GitHub Releases](https://github.com/xuzihan0823/dropship/releases) 下载
-`Dropship-v0.2.0-macos-arm64.dmg`，打开后将 `Dropship.app` 拖入 `Applications`。
+1. 从 [GitHub Releases](https://github.com/xuzihan0823/dropship/releases) 下载
+   `Dropship-v0.2.0-macos-arm64.dmg`。
+2. 打开 DMG，将 `Dropship.app` 拖入 `Applications`。
+3. 从“应用程序”目录启动 Dropship。
 
 当前预编译版本面向 Apple Silicon Mac（arm64）。
 
+> [!IMPORTANT]
+> 当前应用使用 ad-hoc 签名，没有 Developer ID 分发签名，也未经 Apple 公证。macOS
+> 首次运行时可能阻止打开，可在“系统设置 → 隐私与安全性”中选择“仍要打开”，或者执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Dropship.app
+```
+
 ### 从源码构建
+
+构建需要 Xcode（Swift 6 工具链）和 Go：
 
 ```bash
 git clone https://github.com/xuzihan0823/dropship.git
@@ -26,99 +49,80 @@ cd dropship
 open build/Dropship.app
 ```
 
-构建需要 Xcode（Swift 6 工具链）和 Go（用于编译 Linux agent）。
-
-### Gatekeeper 提示
-
-应用使用 ad-hoc 签名，**没有 Developer ID 分发签名，也未经 Apple 公证**。首次打开下载的版本时，macOS 可能会阻止运行；可在系统设置的“隐私与安全性”中选择仍要打开，或者执行：
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Dropship.app
-```
-
-自己构建的产物不受此限制。
-
----
-
 ## 快速开始
 
-1. 打开应用，点侧边栏底部**「从 SSH 导入」**，从 `~/.ssh/config` 选择服务器；也可以点「添加」手动填。
-2. 选中服务器，点工具栏的连接按钮。
-3. 左右面板之间拖文件即可传输。拖到目录行上会落进该目录，拖到空白处落到当前目录。
+1. 打开应用，点击侧边栏底部的“从 SSH 导入”，从 `~/.ssh/config` 选择服务器；也可以点击
+   “添加”手动填写。
+2. 选中服务器并点击连接按钮。
+3. 在左右文件面板之间拖拽文件。拖到目录行会传入该目录，拖到空白处会传入当前目录。
 
-支持从 Finder 直接拖入，也支持把远程文件拖到 Finder（承诺式拖拽，拖出时才真正下载）。
+也可以从 Finder 拖入本地文件，或把远程文件拖到 Finder；后者会在松手后开始下载并交付文件。
 
----
+## Agent 与 SFTP
 
-## 两种传输模式（请务必读这一节）
+| 能力 | Agent 模式（默认） | SFTP 降级模式 |
+|---|---|---|
+| 服务器改动 | 安装约 2.5 MB 的静态二进制 | 不部署 Dropship 二进制 |
+| 传输保护 | 强制大小校验、临时文件、原子替换 | 临时文件与最终大小校验 |
+| 哈希能力 | BLAKE3 远端哈希 | 无远端哈希 |
+| 远端操作 | 结构化协议 | 依赖 `find`、`stat` 等 shell 命令 |
+| 支持平台 | linux/amd64、linux/arm64 | 任何可通过 SSH 使用兼容命令的服务器 |
 
-### Agent 模式（默认）
+### Agent 模式的优势
 
-连接时，Dropship 会**把一个 Go 编译的 agent 二进制上传到你的服务器并执行**。具体是：
+Agent 通过现有 SSH 会话的 `--stdio` 工作，不监听端口，也不是常驻守护进程。上传时先写入
+`.dropship-part`，强制校验实际字节数，校验通过后才原子替换正式文件；SSH 中断时会保留
+临时文件用于续传，而不会用半截数据覆盖原文件。Agent 还提供结构化进度、真实错误、远端
+哈希及文件操作，减少 shell 输出差异带来的兼容性问题。
+
+连接时，Dropship 只会在 Agent 缺失或版本不匹配时安装或更新：
 
 | 项目 | 内容 |
 |---|---|
-| 上传什么 | Dropship agent，静态链接二进制，约 2.5MB |
-| 传到哪 | `$HOME/.local/share/dropship/agent` |
-| 权限 | `0755` |
-| 是否执行 | **是**，每次传输和目录操作都会调用它 |
-| 支持架构 | linux/amd64、linux/arm64 |
+| 安装位置 | `$HOME/.local/share/dropship/agent` |
+| 文件权限 | `0755` |
+| 运行周期 | 每次连接启动 `agent --stdio`，断开后进程结束 |
+| 保留内容 | 断开后仅保留 Agent 二进制，便于下次复用 |
 
-agent 的完整协议契约在 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)，源码在 [`agent/`](agent/)，随仓库一起构建，你可以自己审计和复现。
+Agent 的源码位于 [`agent/`](agent/)，完整协议见
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
-**为什么要这么做**：agent 提供了纯 SSH 命令做不到的保护——传输结束时校验字节数和哈希，校验通过才原子 rename。这直接防住了一类会毁数据的事故：SSH 断线导致的半截文件覆盖服务器上的原文件。
+### 只使用 SFTP
 
-### SFTP 降级模式
-
-**你可以拒绝部署 agent。** 在服务器编辑界面关闭「允许部署并执行 Dropship agent」即可，这个开关**按服务器独立**，关掉后 Dropship 不会向该服务器写入或执行任何二进制。
-
-代价要说清楚：
-
-- 更慢，且不支持传输压缩
-- 传输后**只校验字节数，没有哈希校验**
-- 目录列举依赖服务器上的 `find` / `stat`，兼容性不如 agent
-
-修改开关后需要**断开并重新连接**才会生效。
-
-当前模式会显示在侧边栏服务器名下方（⚡ Agent / 🐢 SFTP 降级）。
-
----
+如果服务器不允许部署二进制，可在服务器编辑界面关闭“允许部署并执行 Dropship Agent”。
+该设置按服务器独立保存，重新连接后生效；Agent 不可用时，Dropship 也会自动降级为 SFTP。
+当前使用的模式会显示在服务器名称下方。
 
 ## 反向收件隧道
 
-有时候你想从服务器**主动**把文件推回 Mac，而不是从 Mac 拉。打开某台服务器的收件隧道后，在服务器上执行：
+开启某台服务器的收件隧道后，可以从服务器主动把文件推送到 Mac：
 
 ```bash
 ~/.local/share/dropship/dropship-send <文件或目录>
 ```
 
-文件会落到 Mac 的 `~/Downloads/Dropship`（可在设置中修改）。目录会自动打包成 `.tar.gz`。
-
-隧道走 SSH 反向端口转发，只监听服务器的回环地址，不对外暴露端口。安全边界详见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §7.6。
-
----
+文件默认保存到 `~/Downloads/Dropship`，可在设置中修改；目录会自动打包为 `.tar.gz`。
+隧道通过 SSH 反向端口转发建立，只监听服务器回环地址，不对外暴露端口。安全边界详见
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) §7.6。
 
 ## 已知限制
 
-- 只支持 macOS 14+ 作为客户端
-- 服务器端 agent 只提供 linux/amd64 与 linux/arm64；其它平台（BSD、其它架构）会自动降级到 SFTP 模式
-- SFTP 降级模式下的续传只校验总字节数，不校验已有 `.part` 前半段的内容是否匹配
-- 尚无自动更新与崩溃上报
-
----
+- 客户端要求 macOS 14+
+- 当前预编译 DMG 仅提供 arm64 版本
+- Agent 仅支持 linux/amd64 与 linux/arm64，其它平台会尝试降级到 SFTP
+- SFTP 续传只校验最终总字节数，不校验已有 `.part` 前半段内容
+- 尚无 Developer ID 分发签名、Apple 公证、自动更新和崩溃上报
 
 ## 开发
 
 ```bash
 swift build                 # 编译
 swift test                  # 运行测试
-./scripts/build-app.sh      # 构建 .app bundle（含 Go agent）
+./scripts/build-app.sh      # 构建 .app（包含 Linux Agent）
 ./scripts/build-dmg.sh      # 构建 release DMG 与 SHA-256
 ```
 
-开发进度、设计决策和历次缺陷的根因分析记录在 [`PROGRESS.md`](PROGRESS.md)。agent 协议契约在 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)，修改前请先读——里面有几条是真机实测教训换来的硬性要求。
-
----
+修改 Agent 或客户端传输实现前，请先阅读 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
 ## License
 
