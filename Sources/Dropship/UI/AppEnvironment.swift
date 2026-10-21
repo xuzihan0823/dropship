@@ -48,7 +48,7 @@ final class AppEnvironment: ObservableObject {
         if store.servers.isEmpty {
             if let parsed = try? store.parseSSHConfig(),
                let target = parsed.first(where: {
-                   $0.hostname == "106.54.40.65" && $0.username == "root"
+                   $0.hostname == "203.0.113.10" && $0.username == "root"
                }) {
                 store.add(target)
                 try? store.save()
